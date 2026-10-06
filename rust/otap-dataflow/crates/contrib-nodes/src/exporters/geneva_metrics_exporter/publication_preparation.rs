@@ -7,7 +7,7 @@ use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest as OtlpMetricsRequest;
 use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{KeyValue as OtlpKeyValue, any_value};
 use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric as otlp_metric;
-use otel_arrow_dfe_pdata::{OtlpProtoBytes, PayloadData};
+use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryFromWithOptions};
 use prost::Message as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,9 +22,9 @@ pub(super) fn prepare_publication(
     data: &OtapPdata,
     config: &Config,
 ) -> Result<PublicationPreparation, PrepareError> {
-    let PayloadData::OtlpBytes(OtlpProtoBytes::ExportMetricsRequest(bytes)) =
-        data.payload_ref().data()
-    else {
+    let otlp = OtlpProtoBytes::try_from_with_default(data.payload_ref().clone())
+        .map_err(|error| PrepareError::PayloadConversion(error.to_string()))?;
+    let OtlpProtoBytes::ExportMetricsRequest(bytes) = otlp else {
         return Err(PrepareError::UnsupportedPayload);
     };
     let receive_time = SystemTime::now()
@@ -176,6 +176,8 @@ fn routing_value(attribute: &OtlpKeyValue) -> &str {
 pub(super) enum PrepareError {
     #[error("Geneva metrics exporter received an unexpected payload")]
     UnsupportedPayload,
+    #[error("Geneva metrics exporter could not convert the metrics payload to OTLP: {0}")]
+    PayloadConversion(String),
     #[error("system clock cannot be represented as an OTLP timestamp")]
     SystemTime,
     #[error(
@@ -197,6 +199,7 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
         Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
     };
+    use otel_arrow_dfe_pdata::{OtapArrowRecords, TryIntoWithOptions};
 
     /// Scenario: The exporter receives a serialized OTLP gauge before HTTP publication is available.
     /// Guarantees: Runtime preparation decodes, maps, and serializes the request into one account packet.
@@ -250,6 +253,73 @@ mod tests {
         let mapping_config = (&config).into();
         let prepared =
             prepare_publication(&data, &mapping_config).expect("publication should prepare");
+
+        let (monitoring_account, packet) = prepared
+            .publication
+            .expect("one publication should be prepared");
+        assert_eq!(monitoring_account, "example-account");
+        assert!(!packet.is_empty());
+        assert_eq!(prepared.rejected_data_points, 0);
+        assert_eq!(prepared.cardinality_overflows, 0);
+    }
+
+    /// Scenario: A metrics filter forwards its native OTAP records to the exporter.
+    /// Guarantees: Preparation converts the records to OTLP and produces a Geneva publication.
+    #[test]
+    fn prepares_otap_records_metric_publication() {
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "temperature".to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                attributes: Vec::new(),
+                                start_time_unix_nano: 0,
+                                time_unix_nano: 1_700_000_000_000_000_000,
+                                exemplars: Vec::new(),
+                                flags: 0,
+                                value: Some(number_data_point::Value::AsDouble(12.5)),
+                            }],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let mut bytes = Vec::new();
+        request
+            .encode(&mut bytes)
+            .expect("request should serialize");
+        let otlp =
+            OtapPdata::new_default(OtlpProtoBytes::ExportMetricsRequest(Bytes::from(bytes)).into());
+        let records: OtapArrowRecords = otlp
+            .payload_ref()
+            .clone()
+            .try_into_with_default()
+            .expect("OTLP metrics should convert to OTAP records");
+        let data = OtapPdata::new_default(records.into());
+        let config = ExporterConfig {
+            endpoint: "https://example.test/metrics".to_string(),
+            monitoring_account: "example-account".to_string(),
+            metric_namespace: "example-namespace".to_string(),
+            timeout: std::time::Duration::from_secs(30),
+            auth: AuthConfig::Bearer,
+            resource_attributes: Vec::new(),
+            honor_resource_attributes: false,
+            scope_attributes: Vec::new(),
+            honor_scope_attributes: false,
+            disable_exemplars: false,
+        };
+
+        let prepared =
+            prepare_publication(&data, &(&config).into()).expect("publication should prepare");
 
         let (monitoring_account, packet) = prepared
             .publication

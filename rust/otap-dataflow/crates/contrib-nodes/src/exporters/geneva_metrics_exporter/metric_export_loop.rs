@@ -5,7 +5,7 @@ use super::client::MetricsPublisher;
 use super::otlp_to_geneva::Config;
 use super::publication_preparation::prepare_publication;
 use async_trait::async_trait;
-use otel_arrow_dfe_config::{SignalFormat, SignalType};
+use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
 use otel_arrow_dfe_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otel_arrow_dfe_engine::error::Error as EngineError;
@@ -23,7 +23,6 @@ use std::future::poll_fn;
 use std::time::Instant;
 
 const UNSUPPORTED_SIGNAL_MESSAGE: &str = "Geneva metrics exporter accepts metrics only";
-const UNSUPPORTED_FORMAT_MESSAGE: &str = "Geneva metrics exporter accepts OTLP only";
 
 const GENEVA_METRICS_AUTH_EVENTS: HttpClientAuthProviderEvents = HttpClientAuthProviderEvents {
     validate_header_name: |_| Ok(()),
@@ -68,25 +67,38 @@ impl GenevaMetricsExporter {
     ) -> Result<(), EngineError> {
         let signal_type = data.signal_type();
         let signal_format = data.signal_format();
+        otel_debug!(
+            "geneva_metrics_exporter.pdata.received",
+            signal_type = ?signal_type,
+            signal_format = ?signal_format,
+        );
         if signal_type != SignalType::Metrics {
+            otel_warn!(
+                "geneva_metrics_exporter.pdata.unsupported_signal",
+                signal_type = ?signal_type,
+                signal_format = ?signal_format,
+            );
             let nack = NackMsg::new_permanent(UNSUPPORTED_SIGNAL_MESSAGE, data);
-            return effect_handler.notify_nack(nack).await;
-        }
-        if signal_format != SignalFormat::OtlpBytes {
-            let nack = NackMsg::new_permanent(UNSUPPORTED_FORMAT_MESSAGE, data);
             return effect_handler.notify_nack(nack).await;
         }
 
         // ExporterInbox force-drains pdata during shutdown even when normal
         // admission is closed, so re-check auth before doing publication work.
         if !self.auth.is_ready() {
-            let nack = NackMsg::new(self.auth.not_ready_reason(), data);
+            let reason = self.auth.not_ready_reason();
+            otel_warn!("geneva_metrics_exporter.auth.not_ready", reason = reason,);
+            let nack = NackMsg::new(reason, data);
             return effect_handler.notify_nack(nack).await;
         }
 
         let prepared = match prepare_publication(&data, &self.mapping_config) {
             Ok(prepared) => prepared,
             Err(error) => {
+                otel_warn!(
+                    "geneva_metrics_exporter.mapping.failed",
+                    signal_format = ?signal_format,
+                    error = %error,
+                );
                 let nack = NackMsg::new_permanent(error.to_string(), data);
                 return effect_handler.notify_nack(nack).await;
             }
@@ -105,7 +117,12 @@ impl GenevaMetricsExporter {
 
         let Some((auth_header_name, auth_header_value, auth_generation)) = self.auth.header()
         else {
-            let nack = NackMsg::new(self.auth.not_ready_reason(), data);
+            let reason = self.auth.not_ready_reason();
+            otel_warn!(
+                "geneva_metrics_exporter.auth.header_missing",
+                reason = reason,
+            );
+            let nack = NackMsg::new(reason, data);
             return effect_handler.notify_nack(nack).await;
         };
         let packet_size = packet.len();
@@ -166,9 +183,21 @@ impl Exporter<OtapPdata> for GenevaMetricsExporter {
         let margin_sleep = tokio::time::sleep_until(tokio::time::Instant::now());
         tokio::pin!(margin_sleep);
         let mut armed_margin_deadline: Option<Instant> = None;
+        let mut previous_auth_ready = None;
 
         loop {
             let accepting_pdata = self.auth.is_ready();
+            if previous_auth_ready != Some(accepting_pdata) {
+                if accepting_pdata {
+                    otel_debug!("geneva_metrics_exporter.auth.ready");
+                } else {
+                    otel_debug!(
+                        "geneva_metrics_exporter.auth.waiting",
+                        reason = self.auth.not_ready_reason(),
+                    );
+                }
+                previous_auth_ready = Some(accepting_pdata);
+            }
             let auth_margin_deadline = self.auth.refresh_deadline();
             if auth_margin_deadline != armed_margin_deadline {
                 if let Some(deadline) = auth_margin_deadline {
@@ -230,12 +259,43 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
         Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
     };
+    use otel_arrow_dfe_pdata::{OtapArrowRecords, TryIntoWithOptions};
     use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
     use prost::Message as _;
     use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::{Layer, layer::Context as LayerContext, prelude::*};
     use wiremock::matchers::{header, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Clone, Default)]
+    struct EventNameCapture {
+        names: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl<S> Layer<S> for EventNameCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
+            self.names
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event.metadata().name());
+        }
+    }
+
+    fn assert_event_was_emitted(names: &Arc<Mutex<Vec<&'static str>>>, expected: &str) {
+        let names = names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            names.contains(&expected),
+            "expected event {expected}, captured {names:?}"
+        );
+    }
 
     struct TestTokenProvider {
         updates: RefCell<Option<UnboundedReceiver<BearerToken>>>,
@@ -364,6 +424,15 @@ mod tests {
             )
     }
 
+    fn metrics_otap_pdata(accounts: &[&str], call_id: usize) -> OtapPdata {
+        let pdata = metrics_pdata(accounts, call_id);
+        let (context, payload) = pdata.into_parts();
+        let records: OtapArrowRecords = payload
+            .try_into_with_default()
+            .expect("OTLP metrics should convert to OTAP records");
+        OtapPdata::new(context, records.into())
+    }
+
     fn completion_harness() -> (
         EffectHandler<OtapPdata>,
         PipelineCompletionMsgReceiver<OtapPdata>,
@@ -432,6 +501,10 @@ mod tests {
             .await;
         let mut exporter = ready_exporter(&server.uri()).await;
         let (effect_handler, mut completions) = completion_harness();
+        let capture = EventNameCapture::default();
+        let event_names = Arc::clone(&capture.names);
+        let subscriber = tracing_subscriber::registry().with(capture);
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         exporter
             .handle_pdata(
@@ -451,6 +524,41 @@ mod tests {
             }
             PipelineCompletionMsg::DeliverAck { .. } => panic!("expected permanent NACK"),
         }
+        assert_event_was_emitted(&event_names, "geneva_metrics_exporter.pdata.received");
+        assert_event_was_emitted(&event_names, "geneva_metrics_exporter.mapping.failed");
+    }
+
+    /// Scenario: The metrics filter forwards OTAP records to the exporter.
+    /// Guarantees: The exporter converts, publishes, and ACKs the filtered payload.
+    #[tokio::test]
+    async fn publishes_otap_records_from_metrics_filter() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut exporter = ready_exporter(&server.uri()).await;
+        let (effect_handler, mut completions) = completion_harness();
+        let capture = EventNameCapture::default();
+        let event_names = Arc::clone(&capture.names);
+        let subscriber = tracing_subscriber::registry().with(capture);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        exporter
+            .handle_pdata(metrics_otap_pdata(&["account-a"], 1), &effect_handler)
+            .await
+            .expect("ACK should be routed");
+
+        match completions.recv().await.expect("completion should arrive") {
+            PipelineCompletionMsg::DeliverAck { .. } => {}
+            PipelineCompletionMsg::DeliverNack { nack } => {
+                panic!("OTAP records should publish successfully: {}", nack.reason)
+            }
+        }
+        assert_event_was_emitted(&event_names, "geneva_metrics_exporter.pdata.received");
+        assert_event_was_emitted(&event_names, "geneva_metrics_exporter.publish.start");
+        assert_event_was_emitted(&event_names, "geneva_metrics_exporter.publish.success");
     }
 
     /// Scenario: Pdata is queued before the bearer provider publishes its initial token.
@@ -468,6 +576,10 @@ mod tests {
         let (effect_handler, mut completions) = completion_harness();
         let (control_tx, pdata_tx, msg_chan) = message_channel(4);
         let control_guard = control_tx.clone();
+        let capture = EventNameCapture::default();
+        let event_names = Arc::clone(&capture.names);
+        let subscriber = tracing_subscriber::registry().with(capture);
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         let driver = async move {
             pdata_tx
@@ -501,6 +613,8 @@ mod tests {
         .expect("exporter should finish after initial auth arrives");
         drop(control_guard);
         let _terminal_state = start_result.expect("exporter should shut down cleanly");
+        assert_event_was_emitted(&event_names, "geneva_metrics_exporter.auth.waiting");
+        assert_event_was_emitted(&event_names, "geneva_metrics_exporter.auth.ready");
     }
 
     /// Scenario: The token stream closes after HTTP 401 while refused pdata is buffered and shutdown begins.
