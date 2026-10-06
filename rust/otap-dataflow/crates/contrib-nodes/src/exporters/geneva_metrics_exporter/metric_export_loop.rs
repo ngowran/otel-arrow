@@ -18,7 +18,7 @@ use otel_arrow_dfe_otap::http_client_auth::{
     new_http_client_auth_provider_from_bearer_token_provider,
 };
 use otel_arrow_dfe_otap::pdata::OtapPdata;
-use otel_arrow_dfe_telemetry::otel_warn;
+use otel_arrow_dfe_telemetry::{otel_debug, otel_warn};
 use std::future::poll_fn;
 use std::time::Instant;
 
@@ -99,6 +99,7 @@ impl GenevaMetricsExporter {
             );
         }
         let Some((monitoring_account, packet)) = prepared.publication else {
+            otel_debug!("geneva_metrics_exporter.publish.empty");
             return effect_handler.notify_ack(AckMsg::new(data)).await;
         };
 
@@ -107,6 +108,12 @@ impl GenevaMetricsExporter {
             let nack = NackMsg::new(self.auth.not_ready_reason(), data);
             return effect_handler.notify_nack(nack).await;
         };
+        let packet_size = packet.len();
+        otel_debug!(
+            "geneva_metrics_exporter.publish.start",
+            monitoring_account = %monitoring_account,
+            packet_size
+        );
         match self
             .publisher
             .publish(
@@ -117,8 +124,21 @@ impl GenevaMetricsExporter {
             )
             .await
         {
-            Ok(()) => effect_handler.notify_ack(AckMsg::new(data)).await,
+            Ok(()) => {
+                otel_debug!(
+                    "geneva_metrics_exporter.publish.success",
+                    monitoring_account = %monitoring_account,
+                    packet_size
+                );
+                effect_handler.notify_ack(AckMsg::new(data)).await
+            }
             Err(error) => {
+                otel_warn!(
+                    "geneva_metrics_exporter.publish.failed",
+                    monitoring_account = %monitoring_account,
+                    packet_size,
+                    error = %error
+                );
                 if error.is_unauthorized() {
                     self.auth.invalidate(auth_generation);
                 }
