@@ -138,6 +138,7 @@ impl GenevaMetricsExporter {
                 packet,
                 auth_header_name,
                 auth_header_value,
+                auth_generation,
             )
             .await
         {

@@ -20,9 +20,12 @@ fixtures, Geneva-compatible mapping for OTLP and OTAP metrics views,
 authenticated HTTP publication, exporter registration, and runtime
 configuration. The registered exporter accepts OTLP metrics payloads.
 
-The exporter requires `auth.type: bearer` and a bound
-`bearer_token_provider`. Providers backed by Azure managed identity are supported, as are other bearer providers configured for the
-Geneva publication resource. The endpoint must use HTTPS.
+The exporter requires a bound `bearer_token_provider` and supports two
+authentication modes. With `auth.type: bearer`, `endpoint` is the full Geneva
+publication URL and the provider credential is sent directly. With
+`auth.type: managed_identity`, `endpoint` is the Geneva home stamp origin. The
+exporter exchanges the managed identity credential for an account-specific GIG
+endpoint and token, then publishes to GIG. The endpoint must use HTTPS.
 
 The exporter currently supports one monitoring account per OTLP request.
 Requests whose resource or data point attributes select multiple accounts are

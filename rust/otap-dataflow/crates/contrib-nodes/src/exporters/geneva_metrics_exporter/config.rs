@@ -19,18 +19,21 @@ pub struct ScopeAttributes {
 }
 
 /// Authentication applied to Geneva metrics publication requests.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthConfig {
     /// Use a bound `bearer_token_provider` capability.
     Bearer,
+
+    /// Exchange a bound managed identity token for an account-specific GIG token.
+    ManagedIdentity,
 }
 
 /// Configuration for the Geneva metrics exporter.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Full Geneva metrics publication endpoint.
+    /// Full publication endpoint for bearer auth, or home stamp origin for managed identity auth.
     pub endpoint: String,
 
     /// Monitoring account receiving the metrics.
@@ -90,6 +93,16 @@ impl Config {
         }
         if endpoint.scheme() != "https" {
             return Err("bearer authentication requires an HTTPS endpoint".to_string());
+        }
+        if self.auth == AuthConfig::ManagedIdentity
+            && (endpoint.path() != "/"
+                || endpoint.query().is_some()
+                || endpoint.fragment().is_some())
+        {
+            return Err(
+                "managed_identity endpoint must be a Geneva home stamp origin without a path, query, or fragment"
+                    .to_string(),
+            );
         }
         if self
             .scope_attributes
@@ -207,6 +220,34 @@ mod tests {
         assert_eq!(
             config.validate(),
             Err("bearer authentication requires an HTTPS endpoint".to_string())
+        );
+    }
+
+    /// Scenario: Managed identity authentication is configured with a Geneva home stamp origin.
+    /// Guarantees: GIG token exchange can be selected without embedding a publication route.
+    #[test]
+    fn accepts_managed_identity_home_stamp() {
+        let mut config = valid_config();
+        config.endpoint = "https://prod6.prod.microsoftmetrics.com".to_string();
+        config.auth = AuthConfig::ManagedIdentity;
+
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    /// Scenario: Managed identity authentication is configured with a classic FE publication route.
+    /// Guarantees: Route mistakes are rejected before the exporter can follow an interactive redirect.
+    #[test]
+    fn rejects_managed_identity_endpoint_path() {
+        let mut config = valid_config();
+        config.endpoint = "https://prod6.prod.microsoftmetrics.com/api/v1/data/metrics".to_string();
+        config.auth = AuthConfig::ManagedIdentity;
+
+        assert_eq!(
+            config.validate(),
+            Err(
+                "managed_identity endpoint must be a Geneva home stamp origin without a path, query, or fragment"
+                    .to_string()
+            )
         );
     }
 

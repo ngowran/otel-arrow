@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::client::MetricsPublisher;
-use super::config::Config as ExporterConfig;
+use super::config::{AuthConfig, Config as ExporterConfig};
 use super::metric_export_loop::GenevaMetricsExporter;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::error::Error as ConfigError;
@@ -64,10 +64,14 @@ fn create_exporter(
         .map_err(|error| ConfigError::InvalidUserConfig {
             error: error.to_string(),
         })?;
-    let publisher = MetricsPublisher::new(&config.endpoint, config.timeout).map_err(|error| {
-        ConfigError::InvalidUserConfig {
-            error: error.to_string(),
+    let publisher = match config.auth {
+        AuthConfig::Bearer => MetricsPublisher::new(&config.endpoint, config.timeout),
+        AuthConfig::ManagedIdentity => {
+            MetricsPublisher::new_managed_identity(&config.endpoint, config.timeout)
         }
+    }
+    .map_err(|error| ConfigError::InvalidUserConfig {
+        error: error.to_string(),
     })?;
     let mapping_config = (&config).into();
 
@@ -141,5 +145,21 @@ mod tests {
         let error = (GENEVA_METRICS_EXPORTER.validate_config)(&config)
             .expect_err("unauthenticated publication should be rejected");
         assert!(error.to_string().contains("unknown variant `none`"));
+    }
+
+    /// Scenario: The exporter receives managed identity authentication with a home stamp origin.
+    /// Guarantees: Configuration validation accepts the account-specific GIG exchange mode.
+    #[test]
+    fn validates_managed_identity_config() {
+        let config = json!({
+            "endpoint": "https://prod6.prod.microsoftmetrics.com",
+            "monitoring_account": "example-account",
+            "metric_namespace": "example-namespace",
+            "auth": {
+                "type": "managed_identity"
+            }
+        });
+
+        assert!((GENEVA_METRICS_EXPORTER.validate_config)(&config).is_ok());
     }
 }
