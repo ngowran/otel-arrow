@@ -19,12 +19,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, ArrowPrimitiveType, AsArray, BooleanArray, DictionaryArray, Float64Array,
-    Int64Array, NullArray, PrimitiveArray, RecordBatch, StringArray, StructArray, UInt8Array,
-    UInt16Array,
+    Array, ArrayRef, ArrowPrimitiveType, AsArray, BooleanArray, DictionaryArray, PrimitiveArray,
+    RecordBatch, StringArray, StructArray, UInt8Array, UInt16Array,
 };
 use arrow::buffer::{BooleanBuffer, ScalarBuffer};
-use arrow::compute::kernels::cmp::{eq, neq};
+use arrow::compute::kernels::cmp::eq;
 use arrow::compute::kernels::merge::merge;
 use arrow::compute::{and_not, cast, filter, max, take};
 use arrow::datatypes::{
@@ -64,8 +63,7 @@ use otel_arrow_dfe_pdata::schema::consts::metadata;
 use otel_arrow_dfe_pdata::schema::{consts, get_field_metadata, update_field_metadata};
 
 use crate::error::{Error, Result};
-use crate::pipeline::PipelineStage;
-use crate::pipeline::expr::eval::{EvalContext, scoped_value_to_join_input};
+use crate::pipeline::expr::eval::{EvalContext, align_value_to_record, scoped_value_to_join_input};
 use crate::pipeline::expr::join::JoinInput;
 use crate::pipeline::expr::join::{
     AttributeToDifferentAttributeJoin, AttributeToSameAttributeJoin, JoinExec,
@@ -77,16 +75,15 @@ use crate::pipeline::expr::types::{
     root_field_supports_dict_encoding, root_field_type,
 };
 use crate::pipeline::expr::{
-    ChildRecordKind, DataScope, LeafEval, RecordScope, RootParentStruct, ScopedExpr, ScopedValue,
-    VALUE_COLUMN_NAME,
+    ChildRecordKind, DataScope, RecordScope, RootParentStruct, ScopedExpr, ScopedValue,
 };
 use crate::pipeline::planner::{AttributesIdentifier, ColumnAccessor, RecordType};
 use crate::pipeline::project::anyval::{
     attempt_coerce_value_column_from_any_value_struct_column, fill_null_type_as_empty,
     is_any_value_data_type, wrap_as_any_value_struct,
 };
-use crate::pipeline::project::{ProjectedSchemaColumn, Projection};
 use crate::pipeline::state::ExecutionState;
+use crate::pipeline::{ParentBehavior, PipelineStage};
 
 /// Representation of assignment source and destination
 pub struct Assignment<'a> {
@@ -118,11 +115,6 @@ pub(crate) struct AssignPipelineStage {
 
     /// Unified execution trees that produce the data to be assigned to the destination.
     sources: Vec<ScopedExpr>,
-
-    /// When this pipeline stage is used in a nested pipeline that processes attributes, it may be
-    /// applying an expression that references the virtual "value" column. This flag will be set if
-    /// the expression references this column.
-    projection_contains_value_column: bool,
 
     /// This is used when assigning attributes to keep track of ID/parent ID membership as we
     /// determine which attributes must be updated or inserted
@@ -177,18 +169,12 @@ impl AssignPipelineStage {
                 &assignment.dest_column,
                 assignment.dest_query_location,
                 &assignment.source,
+                record_type,
             )?;
 
             dest_columns.push(assignment.dest_column);
             source_exprs.push(assignment.source.expr);
         }
-
-        // determine, in the case that we're doing assignment on a nested pipeline for attributes,
-        // whether we need to project the virtual "value" column. We only look at the first expr
-        // because for these nested pipelines, the planner shouldn't be combining multiple
-        // set expressions together due to them all having the same destination.
-        let projection_contains_value_column =
-            projection_references_column(&source_exprs[0], VALUE_COLUMN_NAME);
 
         Ok(Self {
             dest_scopes: dest_columns
@@ -198,7 +184,6 @@ impl AssignPipelineStage {
                 .collect(),
             dest_columns,
             sources: source_exprs,
-            projection_contains_value_column,
             id_bitmap_pool: IdBitmapPool::new(),
         })
     }
@@ -763,35 +748,11 @@ impl AssignPipelineStage {
 
     fn assign_to_nested_attributes(
         &mut self,
-        mut otap_batch: OtapArrowRecords,
+        otap_batch: &OtapArrowRecords,
+        attrs_record_batch: Cow<'_, RecordBatch>,
         eval_results: &mut [Option<ScopedValue>],
         dest_attrs_id: AttributesIdentifier,
-    ) -> Result<OtapArrowRecords> {
-        if otap_batch.root_record_batch().is_none() {
-            return Ok(otap_batch);
-        }
-
-        let attrs_payload_type = match dest_attrs_id {
-            AttributesIdentifier::Record(RecordScope::Signal) => match otap_batch {
-                OtapArrowRecords::Logs(_) => ArrowPayloadType::LogAttrs,
-                OtapArrowRecords::Metrics(_) => ArrowPayloadType::MetricAttrs,
-                OtapArrowRecords::Traces(_) => ArrowPayloadType::SpanAttrs,
-            },
-            AttributesIdentifier::NonRecord(payload_type) => payload_type,
-            AttributesIdentifier::Record(RecordScope::Child(child)) => {
-                return Err(Error::InvalidPipelineError {
-                    cause: format!(
-                        "Cannot assign nested attribute of child {child:?} when executing pipeline on signal"
-                    ),
-                    query_location: Default::default(),
-                });
-            }
-        };
-
-        let Some(mut attrs_record_batch) = otap_batch.get(attrs_payload_type).cloned() else {
-            return Ok(otap_batch);
-        };
-
+    ) -> Result<RecordBatch> {
         let key_column = attrs_record_batch
             .column_by_name(consts::ATTRIBUTE_KEY)
             .ok_or_else(|| Error::ExecutionError {
@@ -827,15 +788,6 @@ impl AssignPipelineStage {
                     );
                     (existing_key_mask, update_parent_ids)
                 };
-            let update_parent_ids_u16 = update_parent_ids
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .ok_or_else(|| Error::ExecutionError {
-                    cause: format!(
-                        "invalid ID column. expected u16 type, found {:?}",
-                        update_parent_ids.data_type()
-                    ),
-                })?;
 
             let mut scoped_value = eval_result
                 .take()
@@ -852,7 +804,7 @@ impl AssignPipelineStage {
             let aligned_values = if let ColumnarValue::Scalar(s) = scoped_value.values {
                 ColumnarValue::Scalar(s)
             } else {
-                let eval_result = scoped_value_to_join_input(scoped_value, &otap_batch)?;
+                let eval_result = scoped_value_to_join_input(scoped_value, otap_batch)?;
                 let ColumnarValue::Array(ref result_values) = eval_result.values else {
                     unreachable!("expected ColumnarResult::Array")
                 };
@@ -860,7 +812,7 @@ impl AssignPipelineStage {
                 let left_join_input = &JoinInput::new_with_parent_ids(
                     ColumnarValue::Scalar(ScalarValue::Null),
                     Rc::clone(&self.dest_scopes[i]),
-                    Arc::new(update_parent_ids_u16.clone()),
+                    Arc::clone(&update_parent_ids),
                 );
 
                 let vals_take_indices = match eval_result.data_scope.as_ref() {
@@ -870,31 +822,19 @@ impl AssignPipelineStage {
                             AttributeToSameAttributeJoin::new().rows_to_take(
                                 left_join_input,
                                 &eval_result,
-                                &otap_batch,
+                                otap_batch,
                             )?
                         } else {
                             AttributeToDifferentAttributeJoin::new(dest_attrs_id, *result_attrs_id)
-                                .rows_to_take(left_join_input, &eval_result, &otap_batch)?
+                                .rows_to_take(left_join_input, &eval_result, otap_batch)?
                         }
                     }
-                    DataScope::Record(RecordScope::Signal) | DataScope::RootParent(_) => {
+                    DataScope::Record(_) | DataScope::RootParent(_) => {
                         RecordAttrsToRecordJoin::new().rows_to_take(
                             left_join_input,
                             &eval_result,
-                            &otap_batch,
+                            otap_batch,
                         )?
-                    }
-                    DataScope::Record(RecordScope::Child(_child)) => {
-                        // In the current implementation, we shouldn't end up here. The planner
-                        // should not allow us to create an expression that would evaluate on some
-                        // child record (like metric data points), and assign the result to an
-                        // attribute. Returning this error to be defensive
-                        return Err(Error::ExecutionError {
-                            cause: format!(
-                                "unexpected DataScope for attribute assignment `{:?}`",
-                                eval_result.data_scope
-                            ),
-                        });
                     }
                     DataScope::StaticScalar => unreachable!("unexpected array for scalar scope"),
                 };
@@ -916,10 +856,8 @@ impl AssignPipelineStage {
             });
         }
 
-        attrs_record_batch = mutate_serialized_attribute_values(&attrs_record_batch, &updates)?;
-        otap_batch.set(attrs_payload_type, attrs_record_batch)?;
-
-        Ok(otap_batch)
+        let new_attrs = mutate_serialized_attribute_values(&attrs_record_batch, &updates)?;
+        Ok(new_attrs)
     }
 
     /// Fills in any nulls in the root batch's ID column with newly assigned IDs.
@@ -1145,10 +1083,36 @@ impl PipelineStage for AssignPipelineStage {
                     source.execute_as_value(&otap_batch, &EvalContext::new(session_context))?;
                 eval_results.push(eval_result);
             }
-            let result =
-                self.assign_to_nested_attributes(otap_batch, &mut eval_results, *attrs_id)?;
 
-            return Ok(result);
+            let attrs_payload_type = match *attrs_id {
+                AttributesIdentifier::Record(RecordScope::Signal) => match otap_batch {
+                    OtapArrowRecords::Logs(_) => ArrowPayloadType::LogAttrs,
+                    OtapArrowRecords::Metrics(_) => ArrowPayloadType::MetricAttrs,
+                    OtapArrowRecords::Traces(_) => ArrowPayloadType::SpanAttrs,
+                },
+                AttributesIdentifier::NonRecord(payload_type) => payload_type,
+                AttributesIdentifier::Record(RecordScope::Child(child)) => {
+                    return Err(Error::InvalidPipelineError {
+                        cause: format!(
+                            "Cannot assign nested attribute of child {child:?} when executing pipeline on signal"
+                        ),
+                        query_location: Default::default(),
+                    });
+                }
+            };
+
+            let Some(attrs_record_batch) = otap_batch.get(attrs_payload_type) else {
+                return Ok(otap_batch);
+            };
+
+            let new_attrs = self.assign_to_nested_attributes(
+                &otap_batch,
+                Cow::Borrowed(attrs_record_batch),
+                &mut eval_results,
+                *attrs_id,
+            )?;
+            otap_batch.set(attrs_payload_type, new_attrs)?;
+            return Ok(otap_batch);
         }
 
         // Assigning to the root batch.. Unlike attribute assignment this does not currently
@@ -1161,6 +1125,11 @@ impl PipelineStage for AssignPipelineStage {
             match &self.dest_columns[i] {
                 ColumnAccessor::ColumnName(dest_col_name) => {
                     otap_batch = match eval_result {
+                        // an all-null result (e.g. every `coalesce` argument was absent) has
+                        // no type to check against the column, so it's assigned as null
+                        Some(eval_result) if eval_result.values.data_type() == DataType::Null => {
+                            self.assign_null_root_column(otap_batch, dest_col_name)
+                        }
                         Some(eval_result) => {
                             self.assign_to_root(otap_batch, eval_result, dest_scope, dest_col_name)
                         }
@@ -1169,6 +1138,10 @@ impl PipelineStage for AssignPipelineStage {
                 }
                 ColumnAccessor::StructCol(struct_col_name, field_name) => {
                     otap_batch = match eval_result {
+                        // as above, an all-null result is assigned as null
+                        Some(eval_result) if eval_result.values.data_type() == DataType::Null => {
+                            self.assign_null_struct_field(otap_batch, struct_col_name, field_name)
+                        }
                         Some(eval_result) => self.assign_to_struct_column(
                             otap_batch,
                             eval_result,
@@ -1276,112 +1249,9 @@ impl PipelineStage for AssignPipelineStage {
             });
         }
 
-        // safety: we've already checked the batch is not empty, and that there aren't any nulls
-        // in this column, which means we should be safe to expect at least one non-null type
-        let input_attr_type = type_column
-            .iter()
-            .flatten()
-            .next()
-            .expect("non-empty batch");
-
-        let input_attr_type =
-            AttributeValueType::try_from(input_attr_type).map_err(|e| Error::ExecutionError {
-                cause: format!("invalid attribute type {input_attr_type}: {e}"),
-            })?;
-
-        // check if every value is the same type - if not, we may have problems evaluating the
-        // expression (if the value is used in the expression).
-        let all_rows_same_attr_type =
-            neq(type_column, &UInt8Array::new_scalar(input_attr_type as u8))?.true_count() == 0;
-
-        // create the record batch that will be the input to the datafusion physical expression..
-        // if the expression involves the attribute value (e.g. `value + 2`), we produce a record
-        // batch with a single column which is the "value", otherwise, the input is an empty record
-        // batch. We do this because we are currently assuming the only types of expressions we
-        // support are those involving the attribute values (referenced as the virtual "value")
-        // column, or expressions involving static constants which don't need input columns.
-        let projected_rb = if self.projection_contains_value_column {
-            if !all_rows_same_attr_type {
-                // if not all the attribute types are the same, we can't determine a single value
-                // column to use in the projection, so return an error. In practice, the batch
-                // should be split apart before this pipeline stage using other operators to ensure
-                // we only have one value type.
-                return Err(Error::ExecutionError {
-                    cause: "All input rows for attribute assignment must have the same type \
-                        if value used in expression"
-                        .into(),
-                });
-            }
-
-            // try to access the values column
-            let values_column_name = match input_attr_type {
-                AttributeValueType::Bool => Some(consts::ATTRIBUTE_BOOL),
-                AttributeValueType::Double => Some(consts::ATTRIBUTE_DOUBLE),
-                AttributeValueType::Int => Some(consts::ATTRIBUTE_INT),
-                AttributeValueType::Str => Some(consts::ATTRIBUTE_STR),
-                AttributeValueType::Empty => None,
-                other => {
-                    return Err(Error::NotYetSupportedError {
-                        message: format!(
-                            "Setting attributes of type {:?} in nested pipeline not yet supported",
-                            other
-                        ),
-                    });
-                }
-            };
-
-            let values_column =
-                values_column_name.and_then(|col| attrs_record_batch.column_by_name(col));
-
-            let values_column: ArrayRef = match values_column {
-                Some(col) => Arc::clone(col),
-                None => {
-                    // here the values column is missing, which basically means the attributes
-                    // were all null. We'll create an all null array as a placeholder column.
-                    let len = attrs_record_batch.num_rows();
-                    match input_attr_type {
-                        AttributeValueType::Bool => Arc::new(BooleanArray::new_null(len)),
-                        AttributeValueType::Double => Arc::new(Float64Array::new_null(len)),
-                        AttributeValueType::Int => Arc::new(Int64Array::new_null(len)),
-                        AttributeValueType::Str => Arc::new(StringArray::new_null(len)),
-                        AttributeValueType::Empty => Arc::new(NullArray::new(len)),
-                        other => {
-                            return Err(Error::NotYetSupportedError {
-                                message: format!(
-                                    "Setting attributes of type {:?} in nested pipeline not yet supported",
-                                    other
-                                ),
-                            });
-                        }
-                    }
-                }
-            };
-
-            // create the input record batch
-            let mut fields = vec![Arc::new(Field::new(
-                VALUE_COLUMN_NAME,
-                values_column.data_type().clone(),
-                true,
-            ))];
-            let mut columns = vec![values_column];
-
-            // remove dict encoding if necessary. This would be needed for certain expressions such
-            // as arithmetic
-            if leaf_requires_dict_downcast(&self.sources[0]) {
-                Projection::try_downcast_dicts(&mut fields, &mut columns)?
-            }
-
-            Cow::Owned(RecordBatch::try_new(
-                Arc::new(Schema::new(fields)),
-                columns,
-            )?)
-        } else {
-            Cow::Borrowed(&attrs_record_batch)
-        };
-
         // evaluate the expression
         let mut result = self.sources[0]
-            .evaluate_on_batch(&projected_rb, &EvalContext::new(session_context))?
+            .evaluate_on_attrs_batch(&attrs_record_batch, &EvalContext::new(session_context))?
             .to_array(attrs_record_batch.num_rows())?;
 
         // determine the "logical" type of the result (e.g. the array type, or the values if the
@@ -1485,7 +1355,12 @@ impl PipelineStage for AssignPipelineStage {
         }
 
         // replace the type column if the result may have changed the type for some row
-        if result_attr_type != input_attr_type || !all_rows_same_attr_type {
+        let type_mismatch = type_column
+            .values()
+            .iter()
+            .any(|val| *val != result_attr_type as u8);
+
+        if type_mismatch {
             let new_type_column = UInt8Array::from_iter_values(std::iter::repeat_n(
                 result_attr_type as u8,
                 attrs_record_batch.num_rows(),
@@ -1521,7 +1396,14 @@ impl PipelineStage for AssignPipelineStage {
                 let mut eval_results = Vec::new();
                 for source in &mut self.sources {
                     let eval_result = source.execute_as_value(&otap_batch, &eval_ctx)?;
-                    eval_results.push(eval_result);
+                    // If the result came from a non-record attribute (resource/scope), align
+                    // it to data-point row order before the attribute upsert. The upsert join
+                    // strategies only handle same-kind parent_id relationships.
+                    eval_results.push(align_non_record_attrs_to_data_point(
+                        eval_result,
+                        metrics_dp_rb,
+                        &otap_batch,
+                    )?);
                 }
 
                 let attrs_payload_type = data_point_type.dp_attrs_payload_type();
@@ -1559,6 +1441,32 @@ impl PipelineStage for AssignPipelineStage {
                 continue;
             }
 
+            if let ColumnAccessor::NestedAttribute(attrs_id, _, _) = &self.dest_columns[0] {
+                let mut eval_results = Vec::new();
+                for source in &mut self.sources {
+                    let eval_result = source.execute_as_value(&otap_batch, &eval_ctx)?;
+                    eval_results.push(align_non_record_attrs_to_data_point(
+                        eval_result,
+                        metrics_dp_rb,
+                        &otap_batch,
+                    )?);
+                }
+
+                let attrs_payload_type = data_point_type.dp_attrs_payload_type();
+                let Some(attrs_record_batch) = otap_batch.get(attrs_payload_type) else {
+                    continue;
+                };
+
+                let new_attrs = self.assign_to_nested_attributes(
+                    &otap_batch,
+                    Cow::Borrowed(attrs_record_batch),
+                    &mut eval_results,
+                    *attrs_id,
+                )?;
+                otap_batch.set(attrs_payload_type, new_attrs)?;
+                continue;
+            }
+
             // TODO support - add support for additional assignment targets for metric data points
             return Err(match self.dest_columns[0] {
                 ColumnAccessor::ColumnName(_) | ColumnAccessor::StructCol(_, _) => {
@@ -1566,13 +1474,9 @@ impl PipelineStage for AssignPipelineStage {
                         message: "assigning metric data point columns not yet supported".into(),
                     }
                 }
-                ColumnAccessor::NestedAttribute(_, _, _) => Error::NotYetSupportedError {
-                    message: "assigning to metric data point nested attributes not yet supported"
-                        .into(),
-                },
-                ColumnAccessor::Attributes(_, _) => {
-                    // safety: we've handled this in the block above
-                    unreachable!("already handled column accessor attributes")
+                ColumnAccessor::NestedAttribute(_, _, _) | ColumnAccessor::Attributes(_, _) => {
+                    // safety: we've handled both of these in the blocks above
+                    unreachable!("already handled column accessor attributes and nested attributes")
                 }
             });
         }
@@ -1583,10 +1487,28 @@ impl PipelineStage for AssignPipelineStage {
     fn supports_exec_on(&self, record_type: &RecordType) -> bool {
         matches!(
             record_type,
-            RecordType::Attributes
-                | RecordType::Signal
-                | RecordType::Child(ChildRecordKind::DataPoint)
+            RecordType::Attributes | RecordType::Signal(_) | RecordType::DataPoint(_)
         )
+    }
+
+    // Parent struct fields, scope schema URLs, and non-record attributes are shared metadata.
+    fn parent_behavior(&self) -> ParentBehavior {
+        let requires_reindex = self.dest_columns.iter().any(|dest| match dest {
+            ColumnAccessor::ColumnName(name) => name == consts::SCHEMA_URL,
+            ColumnAccessor::StructCol(struct_name, _) => {
+                matches!(*struct_name, consts::RESOURCE | consts::SCOPE)
+            }
+            ColumnAccessor::Attributes(AttributesIdentifier::NonRecord(_), _)
+            | ColumnAccessor::NestedAttribute(AttributesIdentifier::NonRecord(_), _, _) => true,
+            ColumnAccessor::Attributes(AttributesIdentifier::Record(_), _)
+            | ColumnAccessor::NestedAttribute(AttributesIdentifier::Record(_), _, _) => false,
+        });
+
+        if requires_reindex {
+            ParentBehavior::RequiresReindex
+        } else {
+            ParentBehavior::Preserves
+        }
     }
 
     fn init_state_for_conditional_branch(
@@ -1620,6 +1542,33 @@ impl PipelineStage for AssignPipelineStage {
         _ = exec_state.remove_extension::<NextIdTracker>();
         Ok(())
     }
+}
+
+/// If the eval result has a non-record attribute scope (resource/scope attrs), align it to
+/// data-point row order. The attribute-to-attribute join strategies in `assign_to_attributes`
+/// assume both sides share a direct parent-child ID relationship, which does not hold for the
+/// grandparent relationship between resource/scope attributes and data points.
+fn align_non_record_attrs_to_data_point(
+    eval_result: Option<ScopedValue>,
+    data_points_rb: &RecordBatch,
+    otap_batch: &OtapArrowRecords,
+) -> Result<Option<ScopedValue>> {
+    let Some(sv) = eval_result else {
+        return Ok(None);
+    };
+
+    if let DataScope::Attribute(AttributesIdentifier::NonRecord(_), _, _) = &sv.scope
+        && matches!(sv.values, ColumnarValue::Array(_))
+    {
+        return Ok(Some(align_value_to_record(
+            sv,
+            RecordScope::Child(ChildRecordKind::DataPoint),
+            data_points_rb,
+            otap_batch,
+        )?));
+    }
+
+    Ok(Some(sv))
 }
 
 struct SerializedAttributeUpdate<'a> {
@@ -2094,36 +2043,6 @@ fn decompose_any_value_upsert<'a, T: ArrowPrimitiveType>(
     Ok(upserts)
 }
 
-/// Check if the top-level `Eval(DatafusionExpr)` node's projection references a given column.
-///
-/// Returns `true` if this is an `Eval(DatafusionExpr)` node whose projection includes the
-/// specified column name. For non-`Eval` nodes or `BatchPredicate` leaves, returns `false`.
-fn projection_references_column(expr: &ScopedExpr, col_name: &str) -> bool {
-    match expr {
-        ScopedExpr::Eval {
-            eval: LeafEval::DatafusionExpr { projection, ..  },
-            ..
-        } => projection.schema.iter().any(|projected_col| {
-            matches!(projected_col, ProjectedSchemaColumn::Root(name) if name == col_name)
-        }),
-        _ => false,
-    }
-}
-
-/// Returns the `downcast_dicts` option from the inner `LeafEval::DatafusionExpr` projection
-/// options, if this is an `Eval(DatafusionExpr)` node. Returns `false` otherwise.
-pub(crate) fn leaf_requires_dict_downcast(expr: &ScopedExpr) -> bool {
-    match expr {
-        ScopedExpr::Eval {
-            eval: LeafEval::DatafusionExpr {
-                projection_opts, ..
-            },
-            ..
-        } => projection_opts.downcast_dicts,
-        _ => false,
-    }
-}
-
 /// Validate that the results of the passed expression can be assigned to the destination.
 /// There are multiple validations performed:
 ///
@@ -2155,6 +2074,7 @@ fn validate_assign(
     dest_column: &ColumnAccessor,
     dest_query_location: Option<&QueryLocation>,
     source_plan: &PlannedOp,
+    record_type: &RecordType,
 ) -> Result<()> {
     match dest_column {
         ColumnAccessor::ColumnName(col_name) => {
@@ -2213,6 +2133,17 @@ fn validate_assign(
         }
         ColumnAccessor::Attributes(dest_attrs_id, _)
         | ColumnAccessor::NestedAttribute(dest_attrs_id, _, _) => {
+            // Data point expressions cannot write to parent (resource/scope) attributes.
+            if matches!(record_type, RecordType::DataPoint(_))
+                && matches!(dest_attrs_id, AttributesIdentifier::NonRecord(_))
+            {
+                return Err(Error::NotYetSupportedError {
+                    message:
+                        "assigning to resource or scope attributes from data points is not supported"
+                            .into(),
+                });
+            }
+
             if !can_assign_type(&ExprLogicalType::AnyValue, &source_plan.expr_type) {
                 return Err(Error::InvalidPipelineError {
                     cause: format!(
@@ -2743,7 +2674,11 @@ mod test {
 
     use crate::{
         parser::default_parser_options,
-        pipeline::{Pipeline, planner::PipelinePlanner, test::exec_logs_pipeline},
+        pipeline::{
+            Pipeline, SignalContext, SignalKind,
+            planner::{PipelinePlanner, RecordType},
+            test::exec_logs_pipeline,
+        },
     };
 
     async fn test_insert_root_column_from_scalar<P: Parser>() {
@@ -3045,7 +2980,7 @@ mod test {
         let pipeline = P::parse("logs | extend event_name = 1").unwrap().pipeline;
         let session_ctx = Pipeline::create_session_context();
         let otap_batch = OtapArrowRecords::Logs(Logs::default());
-        let planner = PipelinePlanner::new();
+        let planner = PipelinePlanner::new(RecordType::Signal(SignalContext::All));
         let result = planner.plan_stages(&pipeline, &session_ctx, &otap_batch);
         match result {
             Err(e) => {
@@ -3075,7 +3010,8 @@ mod test {
         let pipeline = P::parse("logs | extend bad_column = 1").unwrap().pipeline;
         let session_ctx = Pipeline::create_session_context();
         let otap_batch = OtapArrowRecords::Logs(Logs::default());
-        let planner = PipelinePlanner::new();
+        let planner =
+            PipelinePlanner::new(RecordType::Signal(SignalContext::Single(SignalKind::Logs)));
         let result = planner.plan_stages(&pipeline, &session_ctx, &otap_batch);
         match result {
             Err(e) => {
@@ -3108,7 +3044,8 @@ mod test {
             .pipeline;
         let session_ctx = Pipeline::create_session_context();
         let otap_batch = OtapArrowRecords::Logs(Logs::default());
-        let planner = PipelinePlanner::new();
+        let planner =
+            PipelinePlanner::new(RecordType::Signal(SignalContext::Single(SignalKind::Logs)));
         let result = planner.plan_stages(&pipeline, &session_ctx, &otap_batch);
         match result {
             Err(e) => {
@@ -3131,7 +3068,8 @@ mod test {
             .pipeline;
         let session_ctx = Pipeline::create_session_context();
         let otap_batch = OtapArrowRecords::Logs(Logs::default());
-        let planner = PipelinePlanner::new();
+        let planner =
+            PipelinePlanner::new(RecordType::Signal(SignalContext::Single(SignalKind::Logs)));
         let result = planner.plan_stages(&pipeline, &session_ctx, &otap_batch);
         match result {
             Err(e) => {
@@ -3163,7 +3101,7 @@ mod test {
             .unwrap()
             .pipeline;
         let otap_batch = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(otap_batch).await;
 
         match result {
@@ -3198,7 +3136,7 @@ mod test {
             .unwrap()
             .pipeline;
         let input = OtapArrowRecords::Logs(Logs::default());
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(input.clone()).await.unwrap();
         assert_eq!(result, input)
     }
@@ -3209,7 +3147,7 @@ mod test {
             .unwrap()
             .pipeline;
         let input = OtapArrowRecords::Logs(Logs::default());
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(input.clone()).await.unwrap();
         assert_eq!(result, input)
     }
@@ -3221,7 +3159,7 @@ mod test {
         let pipeline_expr = OplParser::parse("logs | extend event_name = \"event\"")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(otap_batch).await.unwrap();
         let logs = result.get(ArrowPayloadType::Logs).unwrap();
         assert_eq!(
@@ -3237,7 +3175,7 @@ mod test {
         let pipeline_expr = OplParser::parse("logs | extend dropped_attributes_count = 1")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(otap_batch).await.unwrap();
         let logs = result.get(ArrowPayloadType::Logs).unwrap();
         assert_eq!(
@@ -3261,7 +3199,7 @@ mod test {
         let pipeline_expr = OplParser::parse("logs | extend severity_text = event_name")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(otap_batch).await.unwrap();
         let logs = result.get(ArrowPayloadType::Logs).unwrap();
         assert_eq!(
@@ -3291,7 +3229,7 @@ mod test {
         let pipeline_expr = OplParser::parse("logs | extend severity_text = attributes[\"attr1\"]")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(otap_batch).await.unwrap();
         let logs = result.get(ArrowPayloadType::Logs).unwrap();
         assert_eq!(
@@ -3330,7 +3268,7 @@ mod test {
         let pipeline_expr = OplParser::parse("logs | extend severity_text = attributes[\"attr1\"]")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(otap_batch).await.unwrap();
         let logs = result.get(ArrowPayloadType::Logs).unwrap();
         assert_eq!(
@@ -3373,7 +3311,7 @@ mod test {
         let pipeline_expr = OplParser::parse("logs | extend severity_text = attributes[\"attr1\"]")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(otap_batch).await.unwrap();
         let logs = result.get(ArrowPayloadType::Logs).unwrap();
         assert_eq!(
@@ -3416,7 +3354,7 @@ mod test {
         let pipeline_expr = OplParser::parse("logs | extend severity_text = attributes[\"attr1\"]")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(otap_batch).await.unwrap();
         let logs = result.get(ArrowPayloadType::Logs).unwrap();
         assert_eq!(
@@ -3438,7 +3376,7 @@ mod test {
         let pipeline_expr = OplParser::parse("logs | set severity_text = attributes[\"x\"]")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(otap_batch).await.unwrap();
 
         let logs = result.get(ArrowPayloadType::Logs).unwrap();
@@ -3459,7 +3397,7 @@ mod test {
         let pipeline_expr = OplParser::parse("logs | set body = severity_text")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(otap_batch).await.unwrap();
 
         let OtlpProtoMessage::Logs(result_logs_data) = otap_to_otlp(&result) else {
@@ -3497,7 +3435,7 @@ mod test {
 
         let query = "logs | extend body = attributes[\"x\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         for input_any_val in sources {
             let logs_data = to_logs_data(vec![
@@ -3566,7 +3504,7 @@ mod test {
 
         let query = "logs | extend body = attributes[\"x\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
 
@@ -3646,7 +3584,7 @@ mod test {
 
         let query = "logs | extend body = attributes[\"x\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
 
@@ -3705,7 +3643,7 @@ mod test {
 
         let query = "logs | extend body = attributes[\"x\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
 
@@ -3758,7 +3696,7 @@ mod test {
 
         let query = "logs | extend attributes[\"x\"] = body";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
 
@@ -3809,7 +3747,7 @@ mod test {
 
         let query = "logs | extend body = body + body";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
 
@@ -3849,7 +3787,7 @@ mod test {
 
         let query = "logs | extend body = severity_text";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
 
@@ -3917,7 +3855,7 @@ mod test {
 
         let query = "logs | extend body = attributes[\"x\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
 
@@ -3953,7 +3891,7 @@ mod test {
         let pipeline_expr = OplParser::parse("traces | set name = attributes[\"x\"]")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         match pipeline.execute(otap_batch).await {
             Err(e) => {
@@ -3978,7 +3916,7 @@ mod test {
         let pipeline_expr = OplParser::parse("traces | set name = attributes[\"x\"]")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         match pipeline.execute(otap_batch).await {
             Err(e) => {
@@ -4016,7 +3954,7 @@ mod test {
         let pipeline_expr = P::parse("logs | extend instrumentation_scope.name = \"new_name\"")
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(input_batch).await.unwrap();
 
         let OtlpProtoMessage::Logs(result_logs_data) = otap_to_otlp(&result) else {
@@ -4074,7 +4012,7 @@ mod test {
 
         let query = "logs | extend instrumentation_scope.name = resource.schema_url";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -4120,7 +4058,7 @@ mod test {
 
         let query = "logs | extend resource.schema_url = instrumentation_scope.name";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input).await.unwrap_err();
         assert!(
             err.to_string()
@@ -4137,7 +4075,7 @@ mod test {
 
         let query = "logs | extend instrumentation_scope.name = event_name";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input).await.unwrap_err();
         assert!(
             err.to_string()
@@ -4171,7 +4109,7 @@ mod test {
         let query =
             "logs | extend instrumentation_scope.name = instrumentation_scope.attributes[\"key\"]";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -4216,7 +4154,7 @@ mod test {
 
         let query = "logs | extend resource.schema_url = instrumentation_scope.attributes[\"key\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input).await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -4263,7 +4201,7 @@ mod test {
 
         let query = "logs | extend instrumentation_scope.name = resource.attributes[\"name\"]";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -4308,7 +4246,7 @@ mod test {
 
         let query = "logs | extend instrumentation_scope.name = 42";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input).await.unwrap_err();
         assert!(
             err.to_string()
@@ -4346,7 +4284,7 @@ mod test {
 
         let query = "logs | extend instrumentation_scope.dropped_attributes_count = 42";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(input).await.unwrap();
 
         let OtlpProtoMessage::Logs(result_logs_data) = otap_to_otlp(&result) else {
@@ -4401,7 +4339,7 @@ mod test {
         // which triggers assign_null_struct_field for the nullable schema_url field
         let query = "logs | extend resource.schema_url = resource.attributes[\"x\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(input).await.unwrap();
 
         let OtlpProtoMessage::Logs(result_logs_data) = otap_to_otlp(&result) else {
@@ -4428,7 +4366,7 @@ mod test {
 
         let query = "logs | extend instrumentation_scope.name = substring(instrumentation_scope.name, 0, 6)";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -4513,7 +4451,7 @@ mod test {
 
         let query = "logs | extend resource.schema_url = \"new_url\"";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(input).await.unwrap();
 
         let OtlpProtoMessage::Logs(result_logs_data) = otap_to_otlp(&result) else {
@@ -4551,7 +4489,7 @@ mod test {
 
         let query = "logs | extend resource.schema_url = \"new_url\"";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(input).await.unwrap();
 
         let OtlpProtoMessage::Logs(result_logs_data) = otap_to_otlp(&result) else {
@@ -4586,7 +4524,7 @@ mod test {
 
         let query = "logs | extend instrumentation_scope.name = \"new_name\", resource.schema_url = \"new_url\"";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(input).await.unwrap();
 
         let OtlpProtoMessage::Logs(result_logs_data) = otap_to_otlp(&result) else {
@@ -4648,7 +4586,7 @@ mod test {
 
         let query = "logs | extend instrumentation_scope.name = resource.attributes[\"url\"]";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -4699,7 +4637,7 @@ mod test {
         let query = "logs | extend instrumentation_scope.name = \"new_name\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
         let input = OtapArrowRecords::Logs(Logs::default());
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(input.clone()).await.unwrap();
         assert_eq!(result, input);
     }
@@ -4718,7 +4656,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = event_name";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -4768,7 +4706,7 @@ mod test {
 
         let query = "logs | extend attributes[\"x\"] = attributes[\"y\"]";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -4818,7 +4756,7 @@ mod test {
 
         let query = "logs | extend attributes[\"x\"] = attributes[\"x\"] * 2";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -4870,7 +4808,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = attributes[\"x\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
 
@@ -4930,7 +4868,7 @@ mod test {
         ]);
         let query = "traces | extend attributes[\"x\"] = \"hello\"";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Traces(traces_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -4974,7 +4912,7 @@ mod test {
         ]);
         let query = "metrics | extend attributes[\"x\"] = \"hello\"";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Metrics(metrics_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5023,7 +4961,7 @@ mod test {
         // there is no attribute z
         let query = "logs | extend attributes[\"y\"] = attributes[\"z\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5060,7 +4998,7 @@ mod test {
         // there is no attribute z
         let query = "logs | extend attributes[\"y\"] = attributes[\"z\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5100,7 +5038,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = attributes[\"x\"] * 2";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5172,7 +5110,7 @@ mod test {
         // there is no attribute z
         let query = "logs | extend attributes[\"x\"] = attributes[\"z\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5223,7 +5161,7 @@ mod test {
             attributes[\"k_double\"] = 4.0
         ";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5302,7 +5240,7 @@ mod test {
             attributes[\"k_double2\"] = 6.0
         ";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5381,7 +5319,7 @@ mod test {
                 attributes[\"k_double2\"] = attributes[\"k_double\"]
         ";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5477,7 +5415,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = resource.attributes[\"x\"]";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5535,7 +5473,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = event_name";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5585,7 +5523,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = \"hello\"";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5646,7 +5584,7 @@ mod test {
 
         let query = "logs | extend resource.attributes[\"y\"] = \"b\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5696,7 +5634,7 @@ mod test {
 
         let query = "logs | extend resource.attributes[\"x\"] = resource.attributes[\"y\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5754,7 +5692,7 @@ mod test {
         let query =
             "logs | extend instrumentation_scope.attributes[\"x\"] = resource.attributes[\"y\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5806,7 +5744,7 @@ mod test {
 
         let query = "logs | extend resource.attributes[\"y\"] = \"b\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5847,7 +5785,7 @@ mod test {
             | extend attributes[\"z\"] = \"c\"
             ";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(to_logs_data(log_records)));
         assert!(input.get(ArrowPayloadType::LogAttrs).is_none());
 
@@ -5906,7 +5844,7 @@ mod test {
 
         let query = "logs | extend resource.attributes[\"y\"] = \"b\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         assert!(input.get(ArrowPayloadType::ResourceAttrs).is_none());
@@ -5945,7 +5883,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = \"hello\"";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -5989,7 +5927,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = event_name";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6034,7 +5972,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = event_name";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6081,7 +6019,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = \"hello\"";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6136,7 +6074,7 @@ mod test {
 
         let query = "logs | extend attributes[\"complex\"].child.name = \"after\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6170,7 +6108,8 @@ mod test {
             .pipeline;
         let session_ctx = Pipeline::create_session_context();
         let otap_batch = OtapArrowRecords::Logs(Logs::default());
-        let planner = PipelinePlanner::new();
+        let planner =
+            PipelinePlanner::new(RecordType::Signal(SignalContext::Single(SignalKind::Logs)));
 
         let result = planner.plan_stages(&pipeline, &session_ctx, &otap_batch);
         match result {
@@ -6206,7 +6145,7 @@ mod test {
 
         let query = "logs | extend attributes[\"complex\"].items[0].name = \"after\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6249,7 +6188,7 @@ mod test {
 
         let query = "logs | extend attributes[\"complex\"].child.name = \"after\", attributes[\"complex\"].child.count = 2";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6283,7 +6222,7 @@ mod test {
 
         let query = "logs | extend attributes[\"missing\"].child = \"after\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6317,7 +6256,7 @@ mod test {
 
         let query = "logs | extend attributes[\"complex\"].missing.name = \"after\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6363,7 +6302,7 @@ mod test {
 
         let query = "logs | extend attributes[\"complex\"].child.name = attributes[\"source\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6415,7 +6354,7 @@ mod test {
 
         let query = "logs | extend attributes[\"complex\"].child.name = attributes[\"source\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6484,7 +6423,7 @@ mod test {
 
         let query = "logs | extend attributes[\"complex\"].child.name = attributes[\"source\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let err = pipeline.execute(input).await.expect_err("mixed RHS errors");
@@ -6508,7 +6447,7 @@ mod test {
 
         let query = "logs | extend attributes[\"complex\"].count = 0 - 1";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6536,7 +6475,7 @@ mod test {
 
         let query = "logs | extend attributes[\"raw\"].name = \"after\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6574,7 +6513,7 @@ mod test {
 
         let query = "logs | set resource.attributes[\"complex\"].child.name = \"after\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6793,7 +6732,7 @@ mod test {
 
         let query = r#"traces | extend attributes["name"] = attributes["complex"]["name"]"#;
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Traces(traces_data));
         let result = pipeline.execute(input).await.unwrap();
 
@@ -6841,7 +6780,7 @@ mod test {
 
         let query = r#"logs | extend attributes["name"] = attributes["complex"]["name"]"#;
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input).await.unwrap_err().to_string();
 
         assert!(
@@ -6864,7 +6803,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = \"hello\", attributes[\"x\"] = \"world\"";
         let pipeline_expr = P::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -6909,7 +6848,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = \"hello\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         assert!(input.get(ArrowPayloadType::LogAttrs).is_none());
@@ -6939,7 +6878,7 @@ mod test {
 
         let query = "logs | extend attributes[\"y\"] = \"hello\", attributes[\"x\"] = \"world\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         assert!(input.get(ArrowPayloadType::LogAttrs).is_none());
@@ -6976,7 +6915,7 @@ mod test {
 
         let query = "logs | extend resource.attributes[\"y\"] = event_name";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input.clone()).await.unwrap_err();
         let err_msg = err.to_string();
         assert!(
@@ -6990,7 +6929,7 @@ mod test {
         // ensure we can't assign from attributes
         let query = "logs | extend resource.attributes[\"y\"] = attributes[\"x\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input.clone()).await.unwrap_err();
         let err_msg = err.to_string();
         assert!(
@@ -7003,7 +6942,7 @@ mod test {
         let query =
             "logs | extend resource.attributes[\"y\"] = instrumentation_scope.attributes[\"x\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input.clone()).await.unwrap_err();
         let err_msg = err.to_string();
         assert!(
@@ -7016,7 +6955,7 @@ mod test {
         // expression requiring join
         let query = "logs | extend resource.attributes[\"y\"] = resource.attributes[\"x\"] * attributes[\"y\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input.clone()).await.unwrap_err();
         let err_msg = err.to_string();
         assert!(
@@ -7036,7 +6975,7 @@ mod test {
 
         let query = "logs | extend instrumentation_scope.attributes[\"y\"] = event_name";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input.clone()).await.unwrap_err();
         let err_msg = err.to_string();
         assert!(
@@ -7050,7 +6989,7 @@ mod test {
         // ensure we can't assign from attributes
         let query = "logs | extend instrumentation_scope.attributes[\"y\"] = attributes[\"x\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let err = pipeline.execute(input.clone()).await.unwrap_err();
         let err_msg = err.to_string();
         assert!(
@@ -7072,7 +7011,7 @@ mod test {
 
         let query = "logs | extend attributes[\"x\"] = \"a\", attributes[\"x\"] = \"b\"";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let result = pipeline.execute(input).await.unwrap();
 
         // assert the end result is from the 2nd assignment
@@ -7109,7 +7048,7 @@ mod test {
 
         for query in queries {
             let pipeline_expr = P::parse(query).unwrap().pipeline;
-            let mut pipeline = Pipeline::new(pipeline_expr);
+            let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
             let result = pipeline.execute(input.clone()).await.unwrap();
 
             let OtlpProtoMessage::Logs(result_logs_data) = otap_to_otlp(&result) else {
@@ -7164,7 +7103,7 @@ mod test {
             set attributes["z"] = attributes["y"], attributes["w"] = attributes["y"]
         "#;
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
 
@@ -7250,7 +7189,7 @@ mod test {
 
         let query = "logs | extend attributes[\"x\"] = 1.0";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -7282,7 +7221,7 @@ mod test {
 
         let query = "logs | extend attributes[\"x\"] = attributes[\"z\"]";
         let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -7321,7 +7260,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -7378,7 +7317,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
         let OtlpProtoMessage::Logs(result_logs_data) = otap_to_otlp(&result) else {
@@ -7423,7 +7362,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -7458,7 +7397,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -7516,7 +7455,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -7560,7 +7499,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -7603,7 +7542,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -7646,7 +7585,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -7687,7 +7626,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -7742,7 +7681,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -7792,7 +7731,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -7840,7 +7779,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(&query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -7911,7 +7850,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(&query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -7963,7 +7902,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(&query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8000,7 +7939,7 @@ mod test {
         let pipeline_expr = OplParser::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8036,7 +7975,7 @@ mod test {
         let pipeline_expr = OplParser::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8082,7 +8021,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(&query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8125,7 +8064,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(&query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8168,7 +8107,7 @@ mod test {
         let pipeline_expr = OplParser::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8208,7 +8147,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(&query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8256,7 +8195,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(&query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8300,7 +8239,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(&query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8356,7 +8295,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(&query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8426,7 +8365,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(&query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8484,7 +8423,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8518,7 +8457,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8557,7 +8496,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -8614,7 +8553,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -8684,7 +8623,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -8726,6 +8665,489 @@ mod test {
         test_update_attr_coalesce_missing_attributes::<KqlParser>().await
     }
 
+    /// Runs `query` on `logs_data` and returns the log records of the first scope.
+    async fn exec_coalesce_query<P: Parser>(query: &str, logs_data: LogsData) -> Vec<LogRecord> {
+        let mut result = exec_logs_pipeline::<P>(query, logs_data).await;
+        std::mem::take(&mut result.resource_logs[0].scope_logs[0].log_records)
+    }
+
+    /// Two logs where no record has the attribute `missing` (and the resource has no
+    /// attributes): the first has attribute `y = "y0"` and body `"b0"`, the second only has
+    /// body `"b1"`.
+    fn logs_for_coalesce_absent_arg() -> LogsData {
+        to_logs_data(vec![
+            LogRecord::build()
+                .attributes(vec![KeyValue::new("y", AnyValue::new_string("y0"))])
+                .body(AnyValue::new_string("b0"))
+                .finish(),
+            LogRecord::build().body(AnyValue::new_string("b1")).finish(),
+        ])
+    }
+
+    /// Asserts the result of `coalesce(<absent>, attributes["y"], body)` assigned to
+    /// `attributes["x"]` on [`logs_for_coalesce_absent_arg`].
+    fn assert_coalesce_fell_back_to_y_then_body(records: &[LogRecord]) {
+        assert_eq!(records.len(), 2, "no logs should be dropped");
+        assert_eq!(
+            records[0].attributes,
+            vec![
+                KeyValue::new("y", AnyValue::new_string("y0")),
+                KeyValue::new("x", AnyValue::new_string("y0")),
+            ]
+        );
+        assert_eq!(
+            records[1].attributes,
+            vec![KeyValue::new("x", AnyValue::new_string("b1"))]
+        );
+    }
+
+    /// Scenario: `coalesce` whose first argument is a record attribute that no record in the
+    /// batch has, followed by a present attribute and the body (see #4300).
+    /// Guarantees: the absent argument is treated as null for every record, so each record
+    /// falls back to the first later argument that has a value (`y0` from the attribute on
+    /// the first record, `b1` from the body on the second) instead of the result being null.
+    async fn test_update_attr_coalesce_record_attr_absent_from_batch<P: Parser>() {
+        let query = r#"logs | extend attributes["x"] = coalesce(attributes["missing"], attributes["y"], body)"#;
+        let records = exec_coalesce_query::<P>(query, logs_for_coalesce_absent_arg()).await;
+        assert_coalesce_fell_back_to_y_then_body(&records);
+    }
+
+    /// Scenario: Run the absent-record-attribute `coalesce` test with the OPL parser.
+    /// Guarantees: OPL planning/evaluation falls back past the absent attribute.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_record_attr_absent_from_batch_opl_parser() {
+        test_update_attr_coalesce_record_attr_absent_from_batch::<OplParser>().await
+    }
+
+    /// Scenario: Run the absent-record-attribute `coalesce` test with the KQL parser.
+    /// Guarantees: KQL planning/evaluation falls back past the absent attribute.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_record_attr_absent_from_batch_kql_parser() {
+        test_update_attr_coalesce_record_attr_absent_from_batch::<KqlParser>().await
+    }
+
+    /// Scenario: `coalesce` whose first argument is a resource attribute when the resource has
+    /// no attributes at all, followed by a record attribute and the body.
+    /// Guarantees: an absent resource attribute is treated as null, so each record falls back
+    /// to the record attribute or the body.
+    async fn test_update_attr_coalesce_resource_attr_absent_from_batch<P: Parser>() {
+        let query = r#"logs | extend attributes["x"] = coalesce(resource.attributes["missing"], attributes["y"], body)"#;
+        let records = exec_coalesce_query::<P>(query, logs_for_coalesce_absent_arg()).await;
+        assert_coalesce_fell_back_to_y_then_body(&records);
+    }
+
+    /// Scenario: Run the absent-resource-attribute `coalesce` test with the OPL parser.
+    /// Guarantees: OPL planning/evaluation falls back past the absent resource attribute.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_resource_attr_absent_from_batch_opl_parser() {
+        test_update_attr_coalesce_resource_attr_absent_from_batch::<OplParser>().await
+    }
+
+    /// Scenario: Run the absent-resource-attribute `coalesce` test with the KQL parser.
+    /// Guarantees: KQL planning/evaluation falls back past the absent resource attribute.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_resource_attr_absent_from_batch_kql_parser() {
+        test_update_attr_coalesce_resource_attr_absent_from_batch::<KqlParser>().await
+    }
+
+    /// Scenario: `coalesce` whose first argument is a nested path under a record attribute
+    /// that no record in the batch has.
+    /// Guarantees: an absent nested attribute path is treated as null, so each record falls
+    /// back to the record attribute or the body.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_nested_attr_absent_from_batch() {
+        let query = r#"logs | extend attributes["x"] = coalesce(attributes["missing"]["k"], attributes["y"], body)"#;
+        let records = exec_coalesce_query::<OplParser>(query, logs_for_coalesce_absent_arg()).await;
+        assert_coalesce_fell_back_to_y_then_body(&records);
+    }
+
+    /// Scenario: `coalesce` whose first argument is the body when no record in the batch has a
+    /// body, followed by a record attribute present on every record (arguments joined across
+    /// scopes), or only by root fields and literals (arguments evaluated in the record's own
+    /// scope): another root field, a literal, or a root field and then a literal.
+    /// Guarantees: an absent body is treated as null, so each record gets its own value from
+    /// the next argument that has one.
+    async fn test_update_attr_coalesce_body_absent_from_batch<P: Parser>() {
+        for (query, expected) in [
+            (
+                r#"logs | extend attributes["x"] = coalesce(body, attributes["y"])"#,
+                ["y0", "y1"],
+            ),
+            (
+                r#"logs | extend attributes["x"] = coalesce(body, severity_text)"#,
+                ["s0", "s1"],
+            ),
+            (
+                r#"logs | extend attributes["x"] = coalesce(body, "foo")"#,
+                ["foo", "foo"],
+            ),
+            (
+                r#"logs | extend attributes["x"] = coalesce(body, event_name, "unknown")"#,
+                ["e0", "unknown"],
+            ),
+        ] {
+            let logs_data = to_logs_data(vec![
+                LogRecord::build()
+                    .attributes(vec![KeyValue::new("y", AnyValue::new_string("y0"))])
+                    .severity_text("s0")
+                    .event_name("e0")
+                    .finish(),
+                LogRecord::build()
+                    .attributes(vec![KeyValue::new("y", AnyValue::new_string("y1"))])
+                    .severity_text("s1")
+                    .finish(),
+            ]);
+            let records = exec_coalesce_query::<P>(query, logs_data).await;
+            assert_eq!(records.len(), 2, "no logs should be dropped: {query}");
+            for (i, record) in records.iter().enumerate() {
+                assert_eq!(
+                    record.attributes,
+                    vec![
+                        KeyValue::new("y", AnyValue::new_string(format!("y{i}"))),
+                        KeyValue::new("x", AnyValue::new_string(expected[i])),
+                    ],
+                    "{query}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: Run the absent-body `coalesce` test with the OPL parser.
+    /// Guarantees: OPL planning/evaluation falls back past the absent body.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_body_absent_from_batch_opl_parser() {
+        test_update_attr_coalesce_body_absent_from_batch::<OplParser>().await
+    }
+
+    /// Scenario: Run the absent-body `coalesce` test with the KQL parser.
+    /// Guarantees: KQL planning/evaluation falls back past the absent body.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_body_absent_from_batch_kql_parser() {
+        test_update_attr_coalesce_body_absent_from_batch::<KqlParser>().await
+    }
+
+    /// Scenario: `coalesce` where every argument is absent from the whole batch, with two
+    /// arguments (record and resource attributes) and with three (adding the body, which no
+    /// record has).
+    /// Guarantees: the pipeline does not fail and the result is null, so every record gets
+    /// `attributes["x"]` with an empty value.
+    async fn test_update_attr_coalesce_all_args_absent_from_batch<P: Parser>() {
+        for query in [
+            r#"logs | extend attributes["x"] = coalesce(attributes["missing"], resource.attributes["missing"])"#,
+            r#"logs | extend attributes["x"] = coalesce(attributes["missing"], resource.attributes["missing"], body)"#,
+        ] {
+            let logs_data = to_logs_data(vec![
+                LogRecord::build()
+                    .attributes(vec![KeyValue::new("y", AnyValue::new_string("y0"))])
+                    .finish(),
+                LogRecord::build().finish(),
+            ]);
+            let records = exec_coalesce_query::<P>(query, logs_data).await;
+            assert_eq!(records.len(), 2, "no logs should be dropped: {query}");
+            assert_eq!(
+                records[0].attributes,
+                vec![
+                    KeyValue::new("y", AnyValue::new_string("y0")),
+                    KeyValue::new("x", AnyValue { value: None }),
+                ],
+                "{query}"
+            );
+            assert_eq!(
+                records[1].attributes,
+                vec![KeyValue::new("x", AnyValue { value: None })],
+                "{query}"
+            );
+        }
+    }
+
+    /// Scenario: Run the all-absent `coalesce` test with the OPL parser.
+    /// Guarantees: OPL planning/evaluation returns null without an error.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_all_args_absent_from_batch_opl_parser() {
+        test_update_attr_coalesce_all_args_absent_from_batch::<OplParser>().await
+    }
+
+    /// Scenario: Run the all-absent `coalesce` test with the KQL parser.
+    /// Guarantees: KQL planning/evaluation returns null without an error.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_all_args_absent_from_batch_kql_parser() {
+        test_update_attr_coalesce_all_args_absent_from_batch::<KqlParser>().await
+    }
+
+    /// Scenario: `coalesce` where every argument before a trailing string literal is absent from
+    /// the whole batch: a single record or resource attribute (evaluated in that attribute's own
+    /// scope), two attribute arguments, or a nested `coalesce` whose own arguments are all
+    /// absent.
+    /// Guarantees: the absent arguments are treated as null, so every record gets the literal
+    /// default instead of a null or an error.
+    async fn test_update_attr_coalesce_absent_args_then_literal<P: Parser>() {
+        for query in [
+            r#"logs | extend attributes["x"] = coalesce(attributes["missing"], "foo")"#,
+            r#"logs | extend attributes["x"] = coalesce(resource.attributes["missing"], "foo")"#,
+            r#"logs | extend attributes["x"] = coalesce(attributes["missing1"], attributes["missing2"], "foo")"#,
+            r#"logs | extend attributes["x"] = coalesce(coalesce(attributes["missing"], resource.attributes["missing"]), "foo")"#,
+        ] {
+            let logs_data = to_logs_data(vec![
+                LogRecord::build()
+                    .attributes(vec![KeyValue::new("y", AnyValue::new_string("y0"))])
+                    .finish(),
+                LogRecord::build().finish(),
+            ]);
+            let records = exec_coalesce_query::<P>(query, logs_data).await;
+            assert_eq!(records.len(), 2, "no logs should be dropped: {query}");
+            assert_eq!(
+                records[0].attributes,
+                vec![
+                    KeyValue::new("y", AnyValue::new_string("y0")),
+                    KeyValue::new("x", AnyValue::new_string("foo")),
+                ],
+                "{query}"
+            );
+            assert_eq!(
+                records[1].attributes,
+                vec![KeyValue::new("x", AnyValue::new_string("foo"))],
+                "{query}"
+            );
+        }
+    }
+
+    /// Scenario: Run the absent-then-literal `coalesce` test with the OPL parser.
+    /// Guarantees: OPL planning/evaluation falls back to the literal.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_absent_args_then_literal_opl_parser() {
+        test_update_attr_coalesce_absent_args_then_literal::<OplParser>().await
+    }
+
+    /// Scenario: Run the absent-then-literal `coalesce` test with the KQL parser.
+    /// Guarantees: KQL planning/evaluation falls back to the literal.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_absent_args_then_literal_kql_parser() {
+        test_update_attr_coalesce_absent_args_then_literal::<KqlParser>().await
+    }
+
+    /// Scenario: assign `coalesce(resource.attributes[...], "foo")` back to a resource attribute
+    /// on a batch with two resources and several logs per resource, both when every resource
+    /// has the attribute and when no resource has it.
+    /// Guarantees: each resource gets its own attribute value (the value stays in the resource's
+    /// scope rather than being aligned to the logs), and when the attribute is absent from the
+    /// whole batch every resource gets the literal.
+    #[tokio::test]
+    async fn test_set_resource_attr_coalesce_resource_attr_then_literal() {
+        let logs_data = |r0: Vec<KeyValue>, r1: Vec<KeyValue>| {
+            LogsData::new(vec![
+                ResourceLogs::new(
+                    Resource::build().attributes(r0).finish(),
+                    vec![ScopeLogs::new(
+                        InstrumentationScope::default(),
+                        vec![LogRecord::build().finish(), LogRecord::build().finish()],
+                    )],
+                ),
+                ResourceLogs::new(
+                    Resource::build().attributes(r1).finish(),
+                    vec![ScopeLogs::new(
+                        InstrumentationScope::default(),
+                        vec![
+                            LogRecord::build().finish(),
+                            LogRecord::build().finish(),
+                            LogRecord::build().finish(),
+                        ],
+                    )],
+                ),
+            ])
+        };
+        let x_of = |logs_data: &LogsData| -> Vec<Option<KeyValue>> {
+            logs_data
+                .resource_logs
+                .iter()
+                .map(|r| {
+                    r.resource
+                        .as_ref()
+                        .and_then(|r| r.attributes.iter().find(|kv| kv.key == "x").cloned())
+                })
+                .collect()
+        };
+        let x = |v: &str| Some(KeyValue::new("x", AnyValue::new_string(v)));
+
+        let query =
+            r#"logs | set resource.attributes["x"] = coalesce(resource.attributes["r"], "foo")"#;
+        let result = exec_logs_pipeline::<OplParser>(
+            query,
+            logs_data(
+                vec![KeyValue::new("r", AnyValue::new_string("r0"))],
+                vec![KeyValue::new("r", AnyValue::new_string("r1"))],
+            ),
+        )
+        .await;
+        assert_eq!(x_of(&result), vec![x("r0"), x("r1")]);
+
+        let query = r#"logs | set resource.attributes["x"] = coalesce(resource.attributes["missing"], "foo")"#;
+        let result = exec_logs_pipeline::<OplParser>(
+            query,
+            logs_data(vec![KeyValue::new("q", AnyValue::new_string("q0"))], vec![]),
+        )
+        .await;
+        assert_eq!(x_of(&result), vec![x("foo"), x("foo")]);
+    }
+
+    /// Scenario: one pipeline runs `coalesce` on a batch where an argument is absent and then on
+    /// a batch where it is present, and the reverse, for arguments joined across scopes, root
+    /// fields only, and an attribute with a literal.
+    /// Guarantees: every batch gets its own correct result: evaluating a batch where an argument
+    /// is absent (as a null column or a null row) doesn't change how a later batch with the
+    /// argument present is evaluated, and vice versa.
+    #[tokio::test]
+    async fn test_update_attr_coalesce_absent_then_present_across_batches() {
+        let absent = || {
+            to_logs_data(vec![
+                LogRecord::build()
+                    .attributes(vec![KeyValue::new("y", AnyValue::new_string("y0"))])
+                    .severity_text("s0")
+                    .finish(),
+                LogRecord::build().severity_text("s1").finish(),
+            ])
+        };
+        let present = || {
+            to_logs_data(vec![
+                LogRecord::build()
+                    .attributes(vec![KeyValue::new("a", AnyValue::new_string("a0"))])
+                    .body(AnyValue::new_string("b0"))
+                    .finish(),
+                LogRecord::build()
+                    .attributes(vec![KeyValue::new("a", AnyValue::new_int(7))])
+                    .body(AnyValue::new_int(3))
+                    .finish(),
+            ])
+        };
+        let x_of = |logs_data: LogsData| -> Vec<Option<AnyValue>> {
+            logs_data.resource_logs[0].scope_logs[0]
+                .log_records
+                .iter()
+                .map(|l| {
+                    l.attributes
+                        .iter()
+                        .find(|kv| kv.key == "x")
+                        .and_then(|kv| kv.value.clone())
+                })
+                .collect()
+        };
+        let s = |v: &str| Some(AnyValue::new_string(v));
+        let null = || Some(AnyValue { value: None });
+
+        for (query, when_absent, when_present) in [
+            (
+                r#"logs | set attributes["x"] = coalesce(attributes["a"], attributes["y"], body)"#,
+                vec![s("y0"), null()],
+                vec![s("a0"), Some(AnyValue::new_int(7))],
+            ),
+            (
+                r#"logs | set attributes["x"] = coalesce(body, severity_text)"#,
+                vec![s("s0"), s("s1")],
+                vec![s("b0"), Some(AnyValue::new_int(3))],
+            ),
+            (
+                r#"logs | set attributes["x"] = coalesce(attributes["a"], "foo")"#,
+                vec![s("foo"), s("foo")],
+                vec![s("a0"), Some(AnyValue::new_int(7))],
+            ),
+        ] {
+            for absent_first in [true, false] {
+                let pipeline_expr = OplParser::parse(query).unwrap().pipeline;
+                let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
+                let order = if absent_first {
+                    [(absent(), &when_absent), (present(), &when_present)]
+                } else {
+                    [(present(), &when_present), (absent(), &when_absent)]
+                };
+                for (input, expected) in order {
+                    let result = pipeline
+                        .execute(otlp_to_otap(&OtlpProtoMessage::Logs(input)))
+                        .await
+                        .unwrap();
+                    let OtlpProtoMessage::Logs(result) = otap_to_otlp(&result) else {
+                        panic!("invalid signal type");
+                    };
+                    assert_eq!(
+                        &x_of(result),
+                        expected,
+                        "{query} absent_first={absent_first}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scenario: assign `coalesce` to the root `severity_text` column where every argument is
+    /// absent from the whole batch, and where absent arguments are followed by a literal.
+    /// Guarantees: the all-absent result is assigned as null (clearing `severity_text`) without
+    /// a type error, and the literal fallback is assigned to every record.
+    #[tokio::test]
+    async fn test_set_root_column_coalesce_absent_args() {
+        for (query, expected) in [
+            (
+                r#"logs | set severity_text = coalesce(attributes["missing"], resource.attributes["missing"])"#,
+                "",
+            ),
+            (
+                r#"logs | set severity_text = coalesce(attributes["missing"], "foo")"#,
+                "foo",
+            ),
+        ] {
+            let logs_data = to_logs_data(vec![
+                LogRecord::build().severity_text("s0").finish(),
+                LogRecord::build().severity_text("s1").finish(),
+            ]);
+            let records = exec_coalesce_query::<OplParser>(query, logs_data).await;
+            assert_eq!(records.len(), 2, "no logs should be dropped: {query}");
+            assert!(
+                records.iter().all(|r| r.severity_text == expected),
+                "{query}: {records:?}"
+            );
+        }
+    }
+
+    /// Scenario: assign `coalesce` to the `instrumentation_scope.name` struct field where every
+    /// argument is absent from the whole batch, and where absent arguments are followed by a
+    /// literal.
+    /// Guarantees: the all-absent result is assigned as null (clearing the scope name) without
+    /// a type error, and the literal fallback is assigned to the scope.
+    #[tokio::test]
+    async fn test_set_struct_field_coalesce_absent_args() {
+        for (query, expected) in [
+            (
+                r#"logs | set instrumentation_scope.name = coalesce(instrumentation_scope.attributes["missing"], resource.attributes["missing"])"#,
+                "",
+            ),
+            (
+                r#"logs | set instrumentation_scope.name = coalesce(instrumentation_scope.attributes["missing"], "foo")"#,
+                "foo",
+            ),
+        ] {
+            let logs_data = LogsData::new(vec![ResourceLogs::new(
+                Resource::build().finish(),
+                vec![ScopeLogs::new(
+                    InstrumentationScope::build().name("scope1").finish(),
+                    vec![
+                        LogRecord::build().event_name("event1").finish(),
+                        LogRecord::build().event_name("event2").finish(),
+                    ],
+                )],
+            )]);
+            let result = exec_logs_pipeline::<OplParser>(query, logs_data).await;
+            let scope_logs = &result.resource_logs[0].scope_logs[0];
+            assert_eq!(
+                scope_logs.log_records.len(),
+                2,
+                "no logs should be dropped: {query}"
+            );
+            let scope_name = scope_logs
+                .scope
+                .as_ref()
+                .map(|s| s.name.as_str())
+                .unwrap_or_default();
+            assert_eq!(scope_name, expected, "{query}");
+        }
+    }
+
     async fn test_update_attr_to_lower_case_function_call<P: Parser>() {
         let logs_data = to_logs_data(vec![
             LogRecord::build()
@@ -8740,7 +9162,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
         let result = pipeline.execute(input).await.unwrap();
@@ -8778,7 +9200,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8817,7 +9239,7 @@ mod test {
         let pipeline_expr = P::parse_with_options(query, default_parser_options())
             .unwrap()
             .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
@@ -8941,7 +9363,7 @@ mod test {
         )
         .unwrap()
         .pipeline;
-        let mut pipeline = Pipeline::new(pipeline_expr);
+        let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
 
         let result = pipeline
             .execute(otlp_to_otap(&OtlpProtoMessage::Logs(to_logs_data(
@@ -9165,7 +9587,7 @@ mod test {
             let pipeline_expr = OplParser::parse_with_options(query, default_parser_options())
                 .unwrap()
                 .pipeline;
-            let mut pipeline = Pipeline::new(pipeline_expr);
+            let mut pipeline = Pipeline::try_new(pipeline_expr).unwrap();
             let err = pipeline
                 .execute(otlp_to_otap(&OtlpProtoMessage::Logs(logs_data)))
                 .await

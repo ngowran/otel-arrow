@@ -7,26 +7,26 @@ mod attributes;
 mod config;
 mod exemplars;
 mod histograms;
+mod memory;
+mod normalization;
 
-use std::collections::HashMap;
+use std::rc::Rc;
 use std::str::{self, Utf8Error};
 
-use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
 #[cfg(test)]
 use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
     Exemplar as OtlpExemplar, ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint,
     ScopeMetrics, exemplar, metric, number_data_point,
 };
-use otel_arrow_dfe_pdata::views::otlp::proto::metrics::{ObjResourceMetrics, ResourceMetricsIter};
-use otel_arrow_dfe_pdata_views::views::common::InstrumentationScopeView;
+use otel_arrow_dfe_pdata::views::otlp::bytes::metrics::RawMetricsData;
+use otel_arrow_dfe_pdata_views::views::common::{AttributeView, InstrumentationScopeView};
 use otel_arrow_dfe_pdata_views::views::metrics::{
-    AggregationTemporality, DataType, DataView, ExemplarView, ExponentialHistogramDataPointView,
-    ExponentialHistogramView, GaugeView, HistogramDataPointView, HistogramView, MetricView,
-    MetricsView, NumberDataPointView, ResourceMetricsView, ScopeMetricsView, SumView, SummaryView,
-    Value,
+    AggregationTemporality, BucketsView, DataType, DataView, ExemplarView,
+    ExponentialHistogramDataPointView, ExponentialHistogramView, GaugeView, HistogramDataPointView,
+    HistogramView, MetricView, MetricsView, NumberDataPointView, ResourceMetricsView,
+    ScopeMetricsView, SumView, SummaryView, Value,
 };
 use otel_arrow_dfe_pdata_views::views::resource::ResourceView;
-use prost::Message;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -46,10 +46,13 @@ use attributes::{
 };
 use exemplars::map_exemplars;
 use histograms::{
-    MAX_EXPONENTIAL_SCALE, MIN_EXPONENTIAL_SCALE, bucket_sum, downscale_if_required,
-    explicit_histogram, sparse_buckets, valid_explicit_histogram,
+    ExplicitHistogram, MAX_EXPONENTIAL_SCALE, MIN_EXPONENTIAL_SCALE, bucket_sum,
+    downscale_if_required, explicit_histogram, sparse_buckets,
 };
+pub(crate) use memory::DEFAULT_MAX_MAPPING_BYTES;
+use memory::MappingMemory;
 
+pub(crate) use config::default_max_mapping_bytes;
 pub use config::{Config, ScopeAttributes};
 
 const DOTNET_UNIX_EPOCH_OFFSET_SECONDS: u64 = 62_135_596_800;
@@ -57,42 +60,17 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 const NANOS_PER_DOTNET_TICK: u64 = 100;
 const DOTNET_TICKS_PER_SECOND: u64 = NANOS_PER_SECOND / NANOS_PER_DOTNET_TICK;
 const MAX_METRIC_NAME_UTF16_UNITS: usize = 512;
-pub(super) const ACCOUNT_ATTRIBUTE: &str = "_microsoft_metrics_account";
-pub(super) const PREVIOUS_ACCOUNT_ATTRIBUTE: &str = "microsoft_metrics_account";
-const BANNED_MONITORING_ACCOUNTS: &[&str] = &[
-    "",
-    "%MDM_MONITORING_ACCOUNT%",
-    "%MONITORING_MDM_ACCOUNT_NAME%",
-    "!AZUREDB_METRICS_ACCOUNT!",
-    "!AZUREDB_SHOEBOX_METRICS_ACCOUNT!",
-    "<unknown>",
-    "Default",
-    "MDM ACCOUNT",
-    "<monitoringAccountPlaceholder>",
-    "*",
-    "{{AccountName}}",
-    "<<Metric Account Name>>",
-];
 const BANNED_METRIC_NAMESPACES: &[&str] = &[
     "_azure_managed_prometheus",
     "MetricsExtension",
     "MetricsExtension2",
 ];
 
-/// A protocol packet and the monitoring account to which it must be published.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Publication {
-    /// Monitoring account selected by OTLP attribute precedence.
-    pub monitoring_account: String,
-    /// Geneva protocol packet for this account.
-    pub packet: Packet,
-}
-
 /// Result of mapping one OTLP export request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MappingOutcome {
-    /// Packets grouped by monitoring account in first-seen order.
-    pub publications: Vec<Publication>,
+    /// Geneva protocol packet for the configured monitoring account.
+    pub packet: Packet,
     /// Number of unsupported or invalid data points that were not mapped.
     pub rejected_data_points: usize,
     /// Cardinality-overflow diagnostics generated from reserved OTLP metadata.
@@ -102,20 +80,23 @@ pub struct MappingOutcome {
 /// Diagnostic context for an OTLP data point marked as a cardinality overflow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardinalityOverflow {
-    /// Monitoring account selected for the faulting metric.
+    /// Monitoring account configured for the mapping.
     pub monitoring_account: String,
     /// Namespace selected for the faulting metric.
-    pub namespace: String,
+    pub namespace: Rc<str>,
     /// Name of the faulting metric.
     pub metric_name: String,
 }
 
-/// OTLP decoding or request-level mapping failure.
+/// Request-level mapping failure.
 #[derive(Debug, Error)]
 pub enum MappingError {
-    /// The serialized request is malformed.
-    #[error("invalid OTLP metrics request: {0}")]
-    Decode(#[from] prost::DecodeError),
+    /// Mapping would exceed the configured conservative allocation budget.
+    #[error("Geneva metrics mapping exceeds max_mapping_bytes ({maximum} bytes)")]
+    MemoryLimit {
+        /// Maximum accounted mapping allocation bytes per input.
+        maximum: usize,
+    },
     /// A string field contains invalid UTF-8.
     #[error("invalid UTF-8 in OTLP metrics request: {0}")]
     InvalidUtf8(#[from] Utf8Error),
@@ -129,21 +110,19 @@ pub enum MappingError {
 
 #[derive(Clone, Debug)]
 struct ResourceContext {
-    monitoring_account: String,
-    namespace: String,
+    namespace: Rc<str>,
     dimensions: Vec<super::encoder::Dimension>,
     original_dimensions: Vec<super::encoder::Dimension>,
 }
 
 #[derive(Clone, Debug)]
 struct PointContext {
-    monitoring_account: String,
-    namespace: String,
+    namespace: Rc<str>,
     dimensions: Vec<super::encoder::Dimension>,
 }
 
 struct MapPointResult {
-    metric: Option<(String, Metric)>,
+    metric: Option<Metric>,
     overflow: Option<CardinalityOverflow>,
 }
 
@@ -155,61 +134,15 @@ impl MapPointResult {
         }
     }
 
-    fn mapped(
-        monitoring_account: String,
-        metric: Metric,
-        overflow: Option<CardinalityOverflow>,
-    ) -> Self {
+    fn mapped(metric: Metric, overflow: Option<CardinalityOverflow>) -> Self {
         Self {
-            metric: Some((monitoring_account, metric)),
+            metric: Some(metric),
             overflow,
         }
     }
 }
 
-struct ExportMetricsRequestView<'a> {
-    request: &'a ExportMetricsServiceRequest,
-}
-
-impl MetricsView for ExportMetricsRequestView<'_> {
-    type ResourceMetrics<'res>
-        = ObjResourceMetrics<'res>
-    where
-        Self: 'res;
-    type ResourceMetricsIter<'res>
-        = ResourceMetricsIter<'res>
-    where
-        Self: 'res;
-
-    fn resources(&self) -> Self::ResourceMetricsIter<'_> {
-        ResourceMetricsIter::new(self.request.resource_metrics.iter())
-    }
-}
-
-/// Decodes an OTLP export request and maps its supported data points.
-pub fn decode_and_map(
-    bytes: &[u8],
-    config: &Config,
-    receive_time_unix_nano: u64,
-) -> Result<MappingOutcome, MappingError> {
-    let request = ExportMetricsServiceRequest::decode(bytes)?;
-    map_request(&request, config, receive_time_unix_nano)
-}
-
-/// Maps a decoded OTLP export request into packets grouped by monitoring account.
-pub fn map_request(
-    request: &ExportMetricsServiceRequest,
-    config: &Config,
-    receive_time_unix_nano: u64,
-) -> Result<MappingOutcome, MappingError> {
-    map_metrics(
-        &ExportMetricsRequestView { request },
-        config,
-        receive_time_unix_nano,
-    )
-}
-
-/// Maps any OTLP or OTAP metrics view into packets grouped by monitoring account.
+/// Maps any OTLP or OTAP metrics view into a single packet for the configured monitoring account.
 pub fn map_metrics<M>(
     metrics: &M,
     config: &Config,
@@ -219,43 +152,72 @@ where
     M: MetricsView,
 {
     config.validate().map_err(MappingError::InvalidConfig)?;
+    let memory = MappingMemory::new(config.max_mapping_bytes);
+    map_metrics_with_memory(metrics, config, receive_time_unix_nano, &memory)
+}
+
+pub(super) fn map_otlp_bytes(
+    bytes: &[u8],
+    config: &Config,
+    receive_time_unix_nano: u64,
+) -> Result<MappingOutcome, MappingError> {
+    config.validate().map_err(MappingError::InvalidConfig)?;
+    let memory = MappingMemory::new(config.max_mapping_bytes);
+    let normalized = normalization::normalize(bytes, &memory)?;
+    let metrics = RawMetricsData::new(&normalized);
+    map_metrics_with_memory(&metrics, config, receive_time_unix_nano, &memory)
+}
+
+fn map_metrics_with_memory<M>(
+    metrics: &M,
+    config: &Config,
+    receive_time_unix_nano: u64,
+    memory: &MappingMemory,
+) -> Result<MappingOutcome, MappingError>
+where
+    M: MetricsView,
+{
     let current_time_bucket = unix_nanos_to_dotnet_seconds_floor(receive_time_unix_nano)
         .ok_or(MappingError::ReceiveTimeOverflow)?;
     let mut outcome = MappingOutcome {
-        publications: Vec::new(),
+        packet: Packet {
+            current_time_bucket,
+            metrics: Vec::new(),
+        },
         rejected_data_points: 0,
         cardinality_overflows: Vec::new(),
     };
-    let mut publication_indexes = HashMap::new();
 
     for resource_metrics in metrics.resources() {
         let mut resource = match resource_metrics.resource() {
-            Some(resource) => resource_context(resource.attributes(), config)?,
-            None => default_resource_context(config),
+            Some(resource) => resource_context(resource.attributes(), config, memory)?,
+            None => default_resource_context(config, memory)?,
         };
 
         for scope_metrics in resource_metrics.scopes() {
-            map_scope(
-                &scope_metrics,
-                &mut resource,
-                config,
-                current_time_bucket,
-                &mut outcome,
-                &mut publication_indexes,
-            )?;
+            map_scope(&scope_metrics, &mut resource, config, memory, &mut outcome)?;
         }
     }
 
     Ok(outcome)
 }
 
+/// The parts of a scope's mapping context shared by every data point within it, grouped to
+/// keep point-mapping function signatures short.
+struct ScopeContext<'a> {
+    resource: &'a ResourceContext,
+    namespace: &'a Rc<str>,
+    dimensions: &'a [super::encoder::Dimension],
+    config: &'a Config,
+    memory: &'a MappingMemory,
+}
+
 fn map_scope<S>(
     scope_metrics: &S,
     resource: &mut ResourceContext,
     config: &Config,
-    current_time_bucket: u64,
+    memory: &MappingMemory,
     outcome: &mut MappingOutcome,
-    publication_indexes: &mut HashMap<String, usize>,
 ) -> Result<(), MappingError>
 where
     S: ScopeMetricsView,
@@ -264,12 +226,13 @@ where
         .scope()
         .filter(|scope| scope.name().is_some_and(|name| !name.is_empty()))
     {
-        attribute_string(scope.attributes(), NAMESPACE_ATTRIBUTE)?
+        attribute_string(scope.attributes(), NAMESPACE_ATTRIBUTE, memory)?
             .unwrap_or_else(|| resource.namespace.clone())
     } else {
         resource.namespace.clone()
     };
-    let scope_dimensions = selected_scope_dimensions(scope_metrics, config)?;
+    let scope_dimensions = selected_scope_dimensions(scope_metrics, config, memory)?;
+    memory.charge_items::<((&str, usize), u8)>(resource.original_dimensions.len())?;
     apply_scope_resource_overrides(
         &mut resource.dimensions,
         &resource.original_dimensions,
@@ -277,6 +240,13 @@ where
         config.honor_resource_attributes,
         config.honor_scope_attributes,
     );
+    let scope = ScopeContext {
+        resource: &*resource,
+        namespace: &scope_namespace,
+        dimensions: &scope_dimensions,
+        config,
+        memory,
+    };
 
     for otlp_metric in scope_metrics.metrics() {
         let name = str::from_utf8(otlp_metric.name())?;
@@ -294,17 +264,7 @@ where
                 for point in gauge.data_points() {
                     record_mapped_metric(
                         outcome,
-                        publication_indexes,
-                        current_time_bucket,
-                        map_number_point(
-                            name,
-                            &point,
-                            resource,
-                            &scope_namespace,
-                            &scope_dimensions,
-                            config,
-                            METRIC_TYPE_GAUGE,
-                        )?,
+                        map_number_point(name, &point, &scope, METRIC_TYPE_GAUGE)?,
                     );
                 }
             }
@@ -322,17 +282,7 @@ where
                 for point in sum.data_points() {
                     record_mapped_metric(
                         outcome,
-                        publication_indexes,
-                        current_time_bucket,
-                        map_number_point(
-                            name,
-                            &point,
-                            resource,
-                            &scope_namespace,
-                            &scope_dimensions,
-                            config,
-                            metric_type,
-                        )?,
+                        map_number_point(name, &point, &scope, metric_type)?,
                     );
                 }
             }
@@ -346,17 +296,7 @@ where
                 for point in histogram.data_points() {
                     record_mapped_metric(
                         outcome,
-                        publication_indexes,
-                        current_time_bucket,
-                        map_histogram_point(
-                            name,
-                            &point,
-                            resource,
-                            &scope_namespace,
-                            &scope_dimensions,
-                            config,
-                            metric_type,
-                        )?,
+                        map_histogram_point(name, &point, &scope, metric_type)?,
                     );
                 }
             }
@@ -370,17 +310,7 @@ where
                 for point in histogram.data_points() {
                     record_mapped_metric(
                         outcome,
-                        publication_indexes,
-                        current_time_bucket,
-                        map_exponential_histogram_point(
-                            name,
-                            &point,
-                            resource,
-                            &scope_namespace,
-                            &scope_dimensions,
-                            config,
-                            metric_type,
-                        )?,
+                        map_exponential_histogram_point(name, &point, &scope, metric_type)?,
                     );
                 }
             }
@@ -399,10 +329,7 @@ where
 fn map_number_point<P>(
     name: &str,
     point: &P,
-    resource: &ResourceContext,
-    scope_namespace: &str,
-    scope_dimensions: &[super::encoder::Dimension],
-    config: &Config,
+    scope: &ScopeContext<'_>,
     metric_type: u32,
 ) -> Result<MapPointResult, MappingError>
 where
@@ -411,26 +338,11 @@ where
     if point.flags().no_recorded_value() {
         return Ok(MapPointResult::rejected(None));
     }
-    let valid_name = valid_metric_name(name);
-    let (context, overflow) = point_context(
-        point.attributes(),
-        resource,
-        scope_namespace,
-        scope_dimensions,
-        config,
-        valid_name.then_some(name),
-    )?;
-    let Some(context) = context else {
-        return Ok(MapPointResult::rejected(overflow));
+    let Some(value) = point.value() else {
+        return Ok(MapPointResult::rejected(None));
     };
-    let mut sampling_type = SUM | COUNT | metric_type | METRIC_ORIGIN_OPEN_TELEMETRY;
-    let exemplars = map_point_exemplars(
-        config,
-        point.exemplars(),
-        point.time_unix_nano(),
-        &mut sampling_type,
-    )?;
-    let values = match point.value().unwrap_or(Value::Integer(0)) {
+    // Negative integers can't be represented as unsigned; fall back to `Double` instead of rejecting.
+    let values = match value {
         Value::Double(value) => MetricValues::Double(NumericValues {
             min: None,
             max: None,
@@ -439,103 +351,98 @@ where
             milliseconds: None,
             histogram: None,
         }),
-        Value::Integer(value) => MetricValues::Unsigned(NumericValues {
-            min: None,
-            max: None,
-            sum: Some(value as u64),
-            count: Some(1),
-            milliseconds: None,
-            histogram: None,
-        }),
-    };
-
-    let Some(time_bucket) = unix_nanos_to_dotnet_seconds_ceil(point.time_unix_nano()) else {
-        return Ok(MapPointResult::rejected(overflow));
-    };
-    Ok(MapPointResult::mapped(
-        context.monitoring_account,
-        Metric {
-            time_bucket: time_bucket as i64,
-            namespace: context.namespace,
-            name: name.to_string(),
-            dimensions: context.dimensions,
-            sampling_type,
-            values,
-            exemplars,
+        Value::Integer(value) => match u64::try_from(value) {
+            Ok(value) => MetricValues::Unsigned(NumericValues {
+                min: None,
+                max: None,
+                sum: Some(value),
+                count: Some(1),
+                milliseconds: None,
+                histogram: None,
+            }),
+            Err(_) => MetricValues::Double(NumericValues {
+                min: None,
+                max: None,
+                sum: Some(value as f64),
+                count: Some(1),
+                milliseconds: None,
+                histogram: None,
+            }),
         },
-        overflow,
-    ))
+    };
+    let sampling_type = SUM | COUNT | metric_type | METRIC_ORIGIN_OPEN_TELEMETRY;
+    map_point(
+        name,
+        point.attributes(),
+        point.exemplars(),
+        point.time_unix_nano(),
+        scope,
+        sampling_type,
+        values,
+    )
+}
+
+/// Builds the sampling-type flags shared by explicit and exponential histograms, adding MIN/MAX
+/// when the point reports those optional aggregates.
+fn histogram_sampling_type(metric_type: u32, min: Option<f64>, max: Option<f64>) -> u32 {
+    let mut sampling_type = SUM | COUNT | HISTOGRAM | metric_type | METRIC_ORIGIN_OPEN_TELEMETRY;
+    if min.is_some() {
+        sampling_type |= MIN;
+    }
+    if max.is_some() {
+        sampling_type |= MAX;
+    }
+    sampling_type
 }
 
 fn map_histogram_point<P>(
     name: &str,
     point: &P,
-    resource: &ResourceContext,
-    scope_namespace: &str,
-    scope_dimensions: &[super::encoder::Dimension],
-    config: &Config,
+    scope: &ScopeContext<'_>,
     metric_type: u32,
 ) -> Result<MapPointResult, MappingError>
 where
     P: HistogramDataPointView,
 {
-    if point.flags().no_recorded_value() || !valid_explicit_histogram(point) {
+    if point.flags().no_recorded_value() {
         return Ok(MapPointResult::rejected(None));
     }
-    let valid_name = valid_metric_name(name);
-    let (context, overflow) = point_context(
-        point.attributes(),
-        resource,
-        scope_namespace,
-        scope_dimensions,
-        config,
-        valid_name.then_some(name),
-    )?;
-    let Some(context) = context else {
-        return Ok(MapPointResult::rejected(overflow));
+    scope.memory.charge_items::<(f64, u32)>(1)?;
+    for _ in point.explicit_bounds() {
+        scope.memory.charge_items::<(f64, u32)>(1)?;
+    }
+    let histogram = match explicit_histogram(point) {
+        ExplicitHistogram::Invalid => return Ok(MapPointResult::rejected(None)),
+        ExplicitHistogram::Empty => None,
+        ExplicitHistogram::Buckets(histogram) => Some(histogram),
     };
-    let histogram = explicit_histogram(point);
-    let mut sampling_type =
-        MIN | MAX | SUM | COUNT | HISTOGRAM | metric_type | METRIC_ORIGIN_OPEN_TELEMETRY;
-    let exemplars = map_point_exemplars(
-        config,
+    // Matches existing behavior for absent optional sums.
+    let sum = point.sum().unwrap_or(0.0);
+    let min = point.min();
+    let max = point.max();
+    let sampling_type = histogram_sampling_type(metric_type, min, max);
+    map_point(
+        name,
+        point.attributes(),
         point.exemplars(),
         point.time_unix_nano(),
-        &mut sampling_type,
-    )?;
-
-    let Some(time_bucket) = unix_nanos_to_dotnet_seconds_ceil(point.time_unix_nano()) else {
-        return Ok(MapPointResult::rejected(overflow));
-    };
-    Ok(MapPointResult::mapped(
-        context.monitoring_account,
-        Metric {
-            time_bucket: time_bucket as i64,
-            namespace: context.namespace,
-            name: name.to_string(),
-            dimensions: context.dimensions,
-            sampling_type,
-            values: MetricValues::Double(NumericValues {
-                min: Some(point.min().unwrap_or(0.0)),
-                max: Some(point.max().unwrap_or(0.0)),
-                sum: Some(point.sum().unwrap_or(0.0)),
-                count: Some(narrow_scalar_count(point.count())),
-                milliseconds: None,
-                histogram,
-            }),
-            exemplars,
-        },
-        overflow,
-    ))
+        scope,
+        sampling_type,
+        MetricValues::Double(NumericValues {
+            min,
+            max,
+            sum: Some(sum),
+            count: Some(point.count()),
+            milliseconds: None,
+            histogram,
+        }),
+    )
 }
 
 fn map_exponential_histogram_point<P>(
     name: &str,
     point: &P,
-    resource: &ResourceContext,
-    scope_namespace: &str,
-    scope_dimensions: &[super::encoder::Dimension],
-    config: &Config,
+    scope: &ScopeContext<'_>,
     metric_type: u32,
 ) -> Result<MapPointResult, MappingError>
 where
@@ -546,6 +453,18 @@ where
     {
         return Ok(MapPointResult::rejected(None));
     }
+    // Matches existing behavior of ignoring zero_threshold and using only zero_count.
+    // Matches existing behavior for absent optional sums.
+    for buckets in [point.positive(), point.negative()].into_iter().flatten() {
+        for count in buckets.bucket_counts() {
+            if count != 0 {
+                scope.memory.charge_items::<(i32, u64)>(1)?;
+            }
+        }
+    }
+    let sum = point.sum().unwrap_or(0.0);
+    let min = point.min();
+    let max = point.max();
     let Some(mut positive) = sparse_buckets(point.positive()) else {
         return Ok(MapPointResult::rejected(None));
     };
@@ -573,111 +492,102 @@ where
     let Some(scale) = i8::try_from(scale).ok() else {
         return Ok(MapPointResult::rejected(None));
     };
-    let valid_name = valid_metric_name(name);
-    let (context, overflow) = point_context(
+    let sampling_type = histogram_sampling_type(metric_type, min, max);
+    map_point(
+        name,
         point.attributes(),
-        resource,
-        scope_namespace,
-        scope_dimensions,
-        config,
-        valid_name.then_some(name),
-    )?;
+        point.exemplars(),
+        point.time_unix_nano(),
+        scope,
+        sampling_type,
+        MetricValues::Double(NumericValues {
+            min,
+            max,
+            sum: Some(sum),
+            count: Some(point.count()),
+            milliseconds: None,
+            histogram: Some(MetricHistogram::Exponential(
+                super::encoder::ExponentialHistogram {
+                    scale,
+                    zero_count: point.zero_count(),
+                    negative,
+                    positive,
+                },
+            )),
+        }),
+    )
+}
+
+/// Resolves the point's namespace/dimension context, exemplars, and Geneva time bucket, then
+/// builds the mapped-point result shared by every data-point kind. Rejects the point early
+/// (still reporting any cardinality-overflow diagnostic) when the context or time bucket
+/// cannot be resolved.
+fn map_point<A, I, E>(
+    name: &str,
+    attributes: impl IntoIterator<Item = A>,
+    exemplars: I,
+    time_unix_nano: u64,
+    scope: &ScopeContext<'_>,
+    mut sampling_type: u32,
+    values: MetricValues,
+) -> Result<MapPointResult, MappingError>
+where
+    A: AttributeView,
+    I: IntoIterator<Item = E>,
+    E: ExemplarView,
+{
+    let valid_name = valid_metric_name(name);
+    let (context, overflow) = point_context(attributes, scope, valid_name.then_some(name))?;
     let Some(context) = context else {
         return Ok(MapPointResult::rejected(overflow));
     };
-    let mut sampling_type =
-        MIN | MAX | SUM | COUNT | HISTOGRAM | metric_type | METRIC_ORIGIN_OPEN_TELEMETRY;
     let exemplars = map_point_exemplars(
-        config,
-        point.exemplars(),
-        point.time_unix_nano(),
+        scope.config,
+        exemplars,
+        time_unix_nano,
         &mut sampling_type,
+        scope.memory,
     )?;
-
-    let Some(time_bucket) = unix_nanos_to_dotnet_seconds_ceil(point.time_unix_nano()) else {
+    let Some(time_bucket) = unix_nanos_to_dotnet_seconds_ceil(time_unix_nano) else {
         return Ok(MapPointResult::rejected(overflow));
     };
+    scope.memory.charge_items::<Metric>(1)?;
+    scope.memory.charge(name.len())?;
     Ok(MapPointResult::mapped(
-        context.monitoring_account,
         Metric {
             time_bucket: time_bucket as i64,
             namespace: context.namespace,
             name: name.to_string(),
             dimensions: context.dimensions,
             sampling_type,
-            values: MetricValues::Double(NumericValues {
-                min: Some(point.min().unwrap_or(0.0)),
-                max: Some(point.max().unwrap_or(0.0)),
-                sum: Some(point.sum().unwrap_or(0.0)),
-                count: Some(narrow_scalar_count(point.count())),
-                milliseconds: None,
-                histogram: Some(MetricHistogram::Exponential(
-                    super::encoder::ExponentialHistogram {
-                        scale,
-                        zero_count: point.zero_count(),
-                        negative,
-                        positive,
-                    },
-                )),
-            }),
+            values,
             exemplars,
         },
         overflow,
     ))
 }
 
-fn record_mapped_metric(
-    outcome: &mut MappingOutcome,
-    publication_indexes: &mut HashMap<String, usize>,
-    current_time_bucket: u64,
-    result: MapPointResult,
-) {
+fn record_mapped_metric(outcome: &mut MappingOutcome, result: MapPointResult) {
     if let Some(overflow) = result.overflow {
         outcome.cardinality_overflows.push(overflow);
     }
-    let Some((monitoring_account, metric)) = result.metric else {
+    let Some(metric) = result.metric else {
         outcome.rejected_data_points += 1;
         return;
     };
-    if !add_metric(
-        outcome,
-        publication_indexes,
-        monitoring_account,
-        current_time_bucket,
-        metric,
-    ) {
+    if !add_metric(outcome, metric) {
         outcome.rejected_data_points += 1;
     }
 }
 
-fn add_metric(
-    outcome: &mut MappingOutcome,
-    publication_indexes: &mut HashMap<String, usize>,
-    monitoring_account: String,
-    current_time_bucket: u64,
-    metric: Metric,
-) -> bool {
-    if is_banned_monitoring_account(&monitoring_account)
-        || is_banned_metric_namespace(&metric.namespace)
-    {
+fn add_metric(outcome: &mut MappingOutcome, metric: Metric) -> bool {
+    if is_banned_metric_namespace(&metric.namespace) {
         return false;
     }
-    if super::encoder::validate_metric(&metric, current_time_bucket).is_err() {
+    if super::encoder::validate_metric(&metric, outcome.packet.current_time_bucket).is_err() {
         return false;
     }
-    if let Some(&index) = publication_indexes.get(&monitoring_account) {
-        outcome.publications[index].packet.metrics.push(metric);
-        return true;
-    }
-    let index = outcome.publications.len();
-    let _ = publication_indexes.insert(monitoring_account.clone(), index);
-    outcome.publications.push(Publication {
-        monitoring_account,
-        packet: Packet {
-            current_time_bucket,
-            metrics: vec![metric],
-        },
-    });
+    outcome.packet.metrics.push(metric);
     true
 }
 
@@ -685,14 +595,11 @@ fn valid_metric_name(name: &str) -> bool {
     name.encode_utf16().count() <= MAX_METRIC_NAME_UTF16_UNITS
 }
 
-fn is_banned_monitoring_account(account: &str) -> bool {
-    BANNED_MONITORING_ACCOUNTS.contains(&account)
-}
-
 fn is_banned_metric_namespace(namespace: &str) -> bool {
     BANNED_METRIC_NAMESPACES.contains(&namespace)
 }
 
+// Non-Delta maps to Cumulative; non-monotonic Delta sums are rejected.
 fn sum_metric_type(is_monotonic: bool, temporality: AggregationTemporality) -> Option<u32> {
     let is_delta = temporality == AggregationTemporality::Delta;
     match (is_monotonic, is_delta) {
@@ -724,6 +631,7 @@ fn map_point_exemplars<I, E>(
     exemplars: I,
     data_point_time: u64,
     sampling_type: &mut u32,
+    memory: &MappingMemory,
 ) -> Result<Vec<MetricExemplar>, MappingError>
 where
     I: IntoIterator<Item = E>,
@@ -732,7 +640,7 @@ where
     if config.disable_exemplars {
         return Ok(Vec::new());
     }
-    let exemplars = map_exemplars(exemplars, data_point_time)?;
+    let exemplars = map_exemplars(exemplars, data_point_time, memory)?;
     if !exemplars.is_empty() {
         *sampling_type |= EXEMPLAR;
     }
@@ -740,31 +648,29 @@ where
 }
 
 fn unix_nanos_to_dotnet_seconds_floor(value: u64) -> Option<u64> {
-    let ticks = unix_nanos_to_dotnet_ticks(value)?;
+    let ticks = unix_nanos_to_dotnet_ticks(value);
     let seconds = ticks / DOTNET_TICKS_PER_SECOND;
     DOTNET_UNIX_EPOCH_OFFSET_SECONDS.checked_add(seconds)
 }
 
 fn unix_nanos_to_dotnet_seconds_ceil(value: u64) -> Option<u64> {
-    let ticks = unix_nanos_to_dotnet_ticks(value)?;
+    let ticks = unix_nanos_to_dotnet_ticks(value);
     let seconds = ticks / DOTNET_TICKS_PER_SECOND;
-    let round_up = u64::from(ticks % DOTNET_TICKS_PER_SECOND != 0);
+    let round_up = u64::from(!ticks.is_multiple_of(DOTNET_TICKS_PER_SECOND));
     DOTNET_UNIX_EPOCH_OFFSET_SECONDS
         .checked_add(seconds)?
         .checked_add(round_up)
 }
 
-fn unix_nanos_to_dotnet_ticks(value: u64) -> Option<u64> {
-    (value <= i64::MAX as u64).then_some(value / NANOS_PER_DOTNET_TICK)
-}
-
-fn narrow_scalar_count(value: u64) -> u64 {
-    u64::from(value as u32)
+fn unix_nanos_to_dotnet_ticks(value: u64) -> u64 {
+    value / NANOS_PER_DOTNET_TICK
 }
 
 #[cfg(test)]
 mod tests {
+
     use otel_arrow_dfe_pdata::proto::OtlpProtoMessage;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
         AnyValue, InstrumentationScope, KeyValue, any_value,
     };
@@ -794,7 +700,28 @@ mod tests {
             scope_attributes: Vec::new(),
             honor_scope_attributes: false,
             disable_exemplars: false,
+            max_mapping_bytes: DEFAULT_MAX_MAPPING_BYTES,
         }
+    }
+
+    fn serialize(request: &ExportMetricsServiceRequest) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        OtlpProtoMessage::Metrics(MetricsData::from(request.clone()))
+            .encode(&mut bytes)
+            .expect("OTLP request should serialize");
+        bytes
+    }
+
+    // Maps through the raw OTLP byte view used by the exporter runtime.
+    fn map_request(
+        request: &ExportMetricsServiceRequest,
+        config: &Config,
+        receive_time_unix_nano: u64,
+    ) -> Result<MappingOutcome, MappingError> {
+        let bytes = serialize(request);
+        let metrics =
+            RawMetricsData::try_new(&bytes).expect("serialized OTLP request should be framed");
+        map_metrics(&metrics, config, receive_time_unix_nano)
     }
 
     fn map_point_exemplars(
@@ -808,6 +735,7 @@ mod tests {
             ExemplarIter::new(exemplars.iter()),
             data_point_time,
             sampling_type,
+            &MappingMemory::default(),
         )
         .expect("test exemplars should contain valid UTF-8")
     }
@@ -890,7 +818,7 @@ mod tests {
     }
 
     /// Scenario: A caller passes whitespace-only required destinations to a public mapping entry point.
-    /// Guarantees: Mapping enforces configuration validation instead of producing publications from invalid defaults.
+    /// Guarantees: Mapping enforces configuration validation instead of producing a packet from invalid defaults.
     #[test]
     fn rejects_invalid_config_at_mapping_boundary() {
         let mut invalid_account = config();
@@ -918,7 +846,6 @@ mod tests {
             attributes: vec![
                 int_attribute("z-dimension", 7),
                 string_attribute(NAMESPACE_ATTRIBUTE, "point-namespace"),
-                string_attribute(ACCOUNT_ATTRIBUTE, "point-account"),
                 string_attribute("a-dimension", "first"),
                 string_attribute("shared", "point"),
                 bool_attribute("otel.metric.overflow", true),
@@ -954,7 +881,6 @@ mod tests {
         };
         let request = request(
             vec![
-                string_attribute(ACCOUNT_ATTRIBUTE, "resource-account"),
                 string_attribute(NAMESPACE_ATTRIBUTE, "resource-namespace"),
                 string_attribute("shared", "resource"),
             ],
@@ -970,11 +896,8 @@ mod tests {
             map_request(&request, &mapping_config, TEST_TIME_NANOS).expect("request should map");
 
         assert_eq!(mapped.rejected_data_points, 0);
-        assert_eq!(mapped.publications.len(), 1);
-        let publication = &mapped.publications[0];
-        assert_eq!(publication.monitoring_account, "point-account");
-        let metric = &publication.packet.metrics[0];
-        assert_eq!(metric.namespace, "point-namespace");
+        let metric = &mapped.packet.metrics[0];
+        assert_eq!(&*metric.namespace, "point-namespace");
         assert_eq!(metric.name, "requests");
         assert_eq!(
             metric.sampling_type,
@@ -984,24 +907,24 @@ mod tests {
             metric.dimensions,
             vec![
                 super::super::encoder::Dimension {
-                    name: "a-dimension".to_string(),
-                    value: "first".to_string(),
+                    name: "a-dimension".into(),
+                    value: "first".into(),
                 },
                 super::super::encoder::Dimension {
-                    name: "shared".to_string(),
-                    value: "point".to_string(),
+                    name: "shared".into(),
+                    value: "point".into(),
                 },
                 super::super::encoder::Dimension {
-                    name: "z-dimension".to_string(),
-                    value: "7".to_string(),
+                    name: "z-dimension".into(),
+                    value: "7".into(),
                 },
             ]
         );
         assert_eq!(
             mapped.cardinality_overflows,
             vec![CardinalityOverflow {
-                monitoring_account: "point-account".to_string(),
-                namespace: "point-namespace".to_string(),
+                monitoring_account: "default-account".to_string(),
+                namespace: "point-namespace".into(),
                 metric_name: "requests".to_string(),
             }]
         );
@@ -1011,13 +934,181 @@ mod tests {
         let honored = map_request(&request, &mapping_config, TEST_TIME_NANOS)
             .expect("request should map with honored attributes");
         assert_eq!(
-            honored.publications[0].packet.metrics[0]
+            honored.packet.metrics[0]
                 .dimensions
                 .iter()
-                .find(|dimension| dimension.name == "shared")
-                .map(|dimension| dimension.value.as_str()),
+                .find(|dimension| dimension.name.as_ref() == "shared")
+                .map(|dimension| dimension.value.as_ref()),
             Some("scope")
         );
+    }
+
+    /// Scenario: Many points inherit a resource namespace and large resource and scope dimension strings.
+    /// Guarantees: Mapping shares the inherited namespace, dimension names, and dimension values across points instead of duplicating their storage.
+    #[test]
+    fn shares_inherited_dimension_strings() {
+        let value = "x".repeat(MAX_DIMENSION_VALUE_UTF16_UNITS);
+        let mut scope = scope_with_metrics(vec![otlp_metric(
+            "temperature",
+            metric::Data::Gauge(Gauge {
+                data_points: vec![gauge_point(Vec::new()); 128],
+            }),
+        )]);
+        scope.scope = Some(InstrumentationScope {
+            name: "meter".to_string(),
+            attributes: vec![string_attribute("scope", &value)],
+            ..Default::default()
+        });
+        let request = request(
+            vec![
+                string_attribute(NAMESPACE_ATTRIBUTE, "resource-namespace"),
+                string_attribute("resource", &value),
+            ],
+            scope,
+        );
+        let mut mapping_config = config();
+        mapping_config.resource_attributes = vec!["*".to_string()];
+        mapping_config.scope_attributes = vec![ScopeAttributes {
+            name: "meter".to_string(),
+            keys: vec!["*".to_string()],
+        }];
+        let mapped =
+            map_request(&request, &mapping_config, TEST_TIME_NANOS).expect("request should map");
+
+        assert_eq!(mapped.rejected_data_points, 0);
+        assert_eq!(mapped.packet.metrics.len(), 128);
+        let first = &mapped.packet.metrics[0];
+        assert_eq!(&*first.namespace, "resource-namespace");
+        assert_eq!(first.dimensions.len(), 2);
+        for dimension in &first.dimensions {
+            assert_eq!(dimension.value.as_ref(), value.as_str());
+        }
+        for metric in &mapped.packet.metrics[1..] {
+            assert!(Rc::ptr_eq(&first.namespace, &metric.namespace));
+            assert_eq!(metric.dimensions.len(), first.dimensions.len());
+            for (inherited, dimension) in first.dimensions.iter().zip(&metric.dimensions) {
+                assert!(Rc::ptr_eq(&inherited.name, &dimension.name));
+                assert!(Rc::ptr_eq(&inherited.value, &dimension.value));
+            }
+        }
+    }
+
+    /// Scenario: Many points each set the same point-level namespace attribute.
+    /// Guarantees: Mapping allocates each distinct namespace once per request instead of once per point.
+    #[test]
+    fn shares_repeated_point_namespaces() {
+        let point = gauge_point(vec![string_attribute(
+            NAMESPACE_ATTRIBUTE,
+            "point-namespace",
+        )]);
+        let scope = scope_with_metrics(vec![otlp_metric(
+            "temperature",
+            metric::Data::Gauge(Gauge {
+                data_points: vec![point; 128],
+            }),
+        )]);
+        let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
+            .expect("request should map");
+
+        assert_eq!(mapped.packet.metrics.len(), 128);
+        let first = &mapped.packet.metrics[0].namespace;
+        assert_eq!(&**first, "point-namespace");
+        assert!(
+            mapped
+                .packet
+                .metrics
+                .iter()
+                .all(|metric| Rc::ptr_eq(first, &metric.namespace))
+        );
+    }
+
+    /// Scenario: Dictionary-encoded OTAP points repeatedly reference the same large dimension.
+    /// Guarantees: Mapping preserves every point while sharing dimension names and values across the whole input.
+    #[test]
+    fn shares_dictionary_encoded_point_dimensions() {
+        use arrow::datatypes::DataType;
+        use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+
+        let value = "v".repeat(MAX_DIMENSION_VALUE_UTF16_UNITS);
+        let point = gauge_point(vec![string_attribute("dimension", &value)]);
+        let request = request(
+            Vec::new(),
+            scope_with_metrics(vec![otlp_metric(
+                "temperature",
+                metric::Data::Gauge(Gauge {
+                    data_points: vec![point; 256],
+                }),
+            )]),
+        );
+        let records = otlp_to_otap(&OtlpProtoMessage::Metrics(request.into()));
+        let attributes = records
+            .get(ArrowPayloadType::NumberDpAttrs)
+            .expect("point attributes");
+        for field in ["key", "str"] {
+            assert!(
+                matches!(
+                    attributes
+                        .column_by_name(field)
+                        .expect("attribute column")
+                        .data_type(),
+                    DataType::Dictionary(_, _)
+                ),
+                "{field} fixture must be dictionary encoded"
+            );
+        }
+        let view = OtapMetricsView::try_from(&records).expect("valid OTAP metrics");
+        let mapped = map_metrics(&view, &config(), TEST_TIME_NANOS).expect("mapping should fit");
+        assert_eq!(mapped.rejected_data_points, 0);
+        assert_eq!(mapped.packet.metrics.len(), 256);
+        let first = &mapped.packet.metrics[0].dimensions[0];
+        assert_eq!(&*first.value, value);
+        for metric in &mapped.packet.metrics {
+            assert_eq!(metric.dimensions.len(), 1);
+            assert!(Rc::ptr_eq(&first.name, &metric.dimensions[0].name));
+            assert!(Rc::ptr_eq(&first.value, &metric.dimensions[0].value));
+        }
+    }
+
+    /// Scenario: A single histogram or a point's exemplar candidates exceed a small mapping budget.
+    /// Guarantees: Mapping refuses these intermediate collections instead of allocating them outside the input budget.
+    #[test]
+    fn bounds_histogram_and_exemplar_mapping_memory() {
+        let histogram = metric::Data::Histogram(Histogram {
+            data_points: vec![HistogramDataPoint {
+                explicit_bounds: (0..4096).map(f64::from).collect(),
+                bucket_counts: vec![1; 4097],
+                count: 4097,
+                time_unix_nano: TEST_TIME_NANOS,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut point = gauge_point(Vec::new());
+        point.exemplars = vec![
+            OtlpExemplar {
+                time_unix_nano: TEST_TIME_NANOS,
+                value: Some(exemplar::Value::AsDouble(1.0)),
+                ..Default::default()
+            };
+            4096
+        ];
+        for data in [
+            histogram,
+            metric::Data::Gauge(Gauge {
+                data_points: vec![point],
+            }),
+        ] {
+            let request = request(
+                Vec::new(),
+                scope_with_metrics(vec![otlp_metric("metric", data)]),
+            );
+            let mut config = config();
+            config.max_mapping_bytes = 4096;
+            assert!(matches!(
+                map_request(&request, &config, TEST_TIME_NANOS),
+                Err(MappingError::MemoryLimit { maximum: 4096 })
+            ));
+        }
     }
 
     /// Scenario: Successive scopes override, omit, and clear one exact-case resource dimension.
@@ -1063,7 +1154,7 @@ mod tests {
 
         assert_eq!(mapped.rejected_data_points, 0);
         assert_eq!(
-            mapped.publications[0]
+            mapped
                 .packet
                 .metrics
                 .iter()
@@ -1071,20 +1162,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 super::super::encoder::Dimension {
-                    name: "region".to_string(),
-                    value: "scope-one".to_string(),
+                    name: "region".into(),
+                    value: "scope-one".into(),
                 },
                 super::super::encoder::Dimension {
-                    name: "region".to_string(),
-                    value: "scope-one".to_string(),
+                    name: "region".into(),
+                    value: "scope-one".into(),
                 },
                 super::super::encoder::Dimension {
-                    name: "region".to_string(),
-                    value: "scope-one".to_string(),
+                    name: "region".into(),
+                    value: "scope-one".into(),
                 },
                 super::super::encoder::Dimension {
-                    name: "region".to_string(),
-                    value: "resource".to_string(),
+                    name: "region".into(),
+                    value: "resource".into(),
                 },
             ]
         );
@@ -1111,8 +1202,7 @@ mod tests {
             .expect("request should map");
 
         assert_eq!(mapped.rejected_data_points, 0);
-        assert_eq!(mapped.publications.len(), 1);
-        let metrics = &mapped.publications[0].packet.metrics;
+        let metrics = &mapped.packet.metrics;
         assert_eq!(metrics.len(), 2);
         assert_eq!(
             metrics[0].sampling_type & super::super::encoder::METRIC_TYPE_MASK,
@@ -1124,8 +1214,54 @@ mod tests {
         );
     }
 
+    /// Scenario: OTLP number points omit their value, or contain a negative integer that the Geneva
+    /// unsigned integer representation cannot hold.
+    /// Guarantees: Points with no value are rejected; negative integers fall back to the `Double`
+    /// representation instead of being dropped.
+    #[test]
+    fn rejects_missing_and_maps_negative_integer_number_values() {
+        let scope = scope_with_metrics(vec![
+            gauge_metric("valid", gauge_point(Vec::new())),
+            gauge_metric(
+                "missing",
+                NumberDataPoint {
+                    time_unix_nano: TEST_TIME_NANOS,
+                    value: None,
+                    ..Default::default()
+                },
+            ),
+            gauge_metric(
+                "negative",
+                NumberDataPoint {
+                    time_unix_nano: TEST_TIME_NANOS,
+                    value: Some(number_data_point::Value::AsInt(-1)),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
+            .expect("request should map");
+
+        assert_eq!(mapped.rejected_data_points, 1);
+        assert_eq!(mapped.packet.metrics.len(), 2);
+        assert_eq!(mapped.packet.metrics[0].name, "valid");
+        assert_eq!(mapped.packet.metrics[1].name, "negative");
+        assert_eq!(
+            mapped.packet.metrics[1].values,
+            MetricValues::Double(NumericValues {
+                min: None,
+                max: None,
+                sum: Some(-1.0),
+                count: Some(1),
+                milliseconds: None,
+                histogram: None,
+            })
+        );
+    }
+
     /// Scenario: OTLP explicit and exponential histograms contain valid distributions.
-    /// Guarantees: Dense OTLP buckets become the expected explicit and sparse exponential histogram models.
+    /// Guarantees: Dense OTLP buckets become the expected histogram models, and absent optional extrema remain absent.
     #[test]
     fn maps_histogram_distributions() {
         let explicit_point = HistogramDataPoint {
@@ -1192,7 +1328,7 @@ mod tests {
         let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
             .expect("request should map");
 
-        let metrics = &mapped.publications[0].packet.metrics;
+        let metrics = &mapped.packet.metrics;
         assert_eq!(
             metrics[0].values,
             MetricValues::Double(NumericValues {
@@ -1215,8 +1351,8 @@ mod tests {
         assert_eq!(
             metrics[1].values,
             MetricValues::Double(NumericValues {
-                min: Some(0.0),
-                max: Some(0.0),
+                min: None,
+                max: None,
                 sum: Some(9.0),
                 count: Some(6),
                 milliseconds: None,
@@ -1231,24 +1367,96 @@ mod tests {
             })
         );
         assert_eq!(metrics[0].sampling_type & (MIN | MAX), MIN | MAX);
-        assert_eq!(metrics[1].sampling_type & (MIN | MAX), MIN | MAX);
+        assert_eq!(metrics[1].sampling_type & (MIN | MAX), 0);
         assert_eq!(metrics[0].sampling_type & IS_RAW_DATA, 0);
         assert_eq!(metrics[1].sampling_type & IS_RAW_DATA, 0);
     }
 
-    /// Scenario: Explicit and exponential histogram scalar counts exceed the Geneva u32 wire field.
-    /// Guarantees: Counts are narrowed to the wire representation while distributions and all metrics remain encodable.
+    /// Scenario: Explicit and exponential OTLP histograms omit their optional sums.
+    /// Guarantees: Both histogram types are published with a zero sum to match Metrics Extension behavior.
     #[test]
-    fn narrows_large_histogram_scalar_counts() {
-        let count = u64::from(u32::MAX) + 1;
-        for (input, expected) in [
-            (0, 0),
-            (u64::from(u32::MAX), u64::from(u32::MAX)),
-            (count, 0),
-            (u64::MAX, u64::from(u32::MAX)),
-        ] {
-            assert_eq!(narrow_scalar_count(input), expected);
+    fn defaults_missing_histogram_sums_to_zero() {
+        let scope = scope_with_metrics(vec![
+            gauge_metric("valid", gauge_point(Vec::new())),
+            otlp_metric(
+                "explicit",
+                metric::Data::Histogram(Histogram {
+                    data_points: vec![HistogramDataPoint {
+                        time_unix_nano: TEST_TIME_NANOS,
+                        count: 1,
+                        bucket_counts: vec![1],
+                        sum: None,
+                        ..Default::default()
+                    }],
+                    aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                }),
+            ),
+            otlp_metric(
+                "exponential",
+                metric::Data::ExponentialHistogram(ExponentialHistogram {
+                    data_points: vec![ExponentialHistogramDataPoint {
+                        time_unix_nano: TEST_TIME_NANOS,
+                        count: 1,
+                        zero_count: 1,
+                        sum: None,
+                        ..Default::default()
+                    }],
+                    aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                }),
+            ),
+        ]);
+
+        let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
+            .expect("request should map");
+
+        assert_eq!(mapped.rejected_data_points, 0);
+        assert_eq!(mapped.packet.metrics.len(), 3);
+        for metric in &mapped.packet.metrics[1..] {
+            let MetricValues::Double(values) = &metric.values else {
+                panic!("histogram should map to double values");
+            };
+            assert_eq!(values.sum, Some(0.0));
         }
+    }
+
+    /// Scenario: An exponential histogram data point sets a nonzero `zero_threshold`.
+    /// Guarantees: The point is mapped using only `zero_count`, matching existing behavior of
+    /// ignoring the zero threshold.
+    #[test]
+    fn ignores_nonzero_zero_threshold() {
+        let scope = scope_with_metrics(vec![otlp_metric(
+            "exponential",
+            metric::Data::ExponentialHistogram(ExponentialHistogram {
+                data_points: vec![ExponentialHistogramDataPoint {
+                    time_unix_nano: TEST_TIME_NANOS,
+                    count: 1,
+                    sum: Some(1.0),
+                    zero_count: 1,
+                    zero_threshold: 0.5,
+                    ..Default::default()
+                }],
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+            }),
+        )]);
+
+        let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
+            .expect("request should map");
+
+        assert_eq!(mapped.rejected_data_points, 0);
+        assert_eq!(mapped.packet.metrics.len(), 1);
+        let MetricValues::Double(values) = &mapped.packet.metrics[0].values else {
+            panic!("histogram should use double values");
+        };
+        let Some(MetricHistogram::Exponential(histogram)) = &values.histogram else {
+            panic!("exponential histogram should be present");
+        };
+        assert_eq!(histogram.zero_count, 1);
+    }
+    /// Scenario: Explicit and exponential histograms report scalar counts above the Geneva `u32` wire limit.
+    /// Guarantees: Oversized counts are rejected instead of wrapping while other valid metrics remain publishable.
+    #[test]
+    fn rejects_large_histogram_scalar_counts() {
+        let count = u64::from(u32::MAX) + 1;
         let scope = scope_with_metrics(vec![
             gauge_metric("valid", gauge_point(Vec::new())),
             otlp_metric(
@@ -1281,18 +1489,11 @@ mod tests {
         let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
             .expect("request should map");
 
-        assert_eq!(mapped.rejected_data_points, 0);
-        assert_eq!(mapped.publications.len(), 1);
-        assert_eq!(mapped.publications[0].packet.metrics.len(), 3);
-        assert_eq!(mapped.publications[0].packet.metrics[0].name, "valid");
-        for metric in &mapped.publications[0].packet.metrics[1..] {
-            let MetricValues::Double(values) = &metric.values else {
-                panic!("histogram should use double values");
-            };
-            assert_eq!(values.count, Some(0));
-        }
-        let _ = super::super::encoder::encode(&mapped.publications[0].packet)
-            .expect("all mapped metrics should encode");
+        assert_eq!(mapped.rejected_data_points, 2);
+        assert_eq!(mapped.packet.metrics.len(), 1);
+        assert_eq!(mapped.packet.metrics[0].name, "valid");
+        let _ = super::super::encoder::encode(&mapped.packet)
+            .expect("remaining mapped metrics should encode");
     }
 
     /// Scenario: Receive and datapoint timestamps share a fractional whole-second boundary.
@@ -1314,8 +1515,6 @@ mod tests {
             unix_nanos_to_dotnet_seconds_floor(fractional),
             Some(DOTNET_UNIX_EPOCH_OFFSET_SECONDS + 45)
         );
-        assert_eq!(unix_nanos_to_dotnet_seconds_ceil(i64::MAX as u64 + 1), None);
-
         let scope = scope_with_metrics(vec![gauge_metric(
             "fractional",
             NumberDataPoint {
@@ -1327,17 +1526,46 @@ mod tests {
             .expect("request should map");
 
         assert_eq!(
-            mapped.publications[0].packet.current_time_bucket,
+            mapped.packet.current_time_bucket,
             DOTNET_UNIX_EPOCH_OFFSET_SECONDS + 45
         );
         assert_eq!(
-            mapped.publications[0].packet.metrics[0].time_bucket,
+            mapped.packet.metrics[0].time_bucket,
             (DOTNET_UNIX_EPOCH_OFFSET_SECONDS + 46) as i64
         );
     }
 
+    /// Scenario: A data point reports a timestamp beyond `i64::MAX` nanoseconds, which OTLP's
+    /// unsigned wire format allows but OTAP's signed internal representation cannot hold.
+    /// Guarantees: The point is still mapped to the correct bucket instead of being rejected,
+    /// since converting to 100ns ticks keeps every value in range far below `u64::MAX`.
+    #[test]
+    fn maps_timestamps_beyond_signed_nanosecond_range() {
+        assert_eq!(
+            unix_nanos_to_dotnet_seconds_floor(u64::MAX),
+            Some(80_582_340_873)
+        );
+        assert_eq!(
+            unix_nanos_to_dotnet_seconds_ceil(u64::MAX),
+            Some(80_582_340_874)
+        );
+
+        let scope = scope_with_metrics(vec![gauge_metric(
+            "far-future",
+            NumberDataPoint {
+                time_unix_nano: i64::MAX as u64 + 1,
+                ..gauge_point(Vec::new())
+            },
+        )]);
+        let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
+            .expect("request should map");
+
+        assert_eq!(mapped.rejected_data_points, 0);
+        assert_eq!(mapped.packet.metrics.len(), 1);
+    }
+
     /// Scenario: An explicit histogram reports only scalar count and sum without a bucket distribution.
-    /// Guarantees: The mapped metric retains scalar fields without a histogram body and remains encodable.
+    /// Guarantees: The mapped metric retains supplied scalar fields without inventing extrema and remains encodable.
     #[test]
     fn maps_distributionless_explicit_histogram_as_scalar_only() {
         let point = HistogramDataPoint {
@@ -1356,25 +1584,25 @@ mod tests {
 
         let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
             .expect("request should map");
-        let metric = &mapped.publications[0].packet.metrics[0];
+        let metric = &mapped.packet.metrics[0];
 
         assert_eq!(
             metric.sampling_type & (MIN | MAX | HISTOGRAM | IS_RAW_DATA),
-            MIN | MAX | HISTOGRAM
+            HISTOGRAM
         );
         assert_eq!(
             metric.values,
             MetricValues::Double(NumericValues {
-                min: Some(0.0),
-                max: Some(0.0),
+                min: None,
+                max: None,
                 sum: Some(12.5),
                 count: Some(17),
                 milliseconds: None,
                 histogram: None,
             })
         );
-        let encoded = super::super::encoder::encode(&mapped.publications[0].packet)
-            .expect("empty histogram should encode");
+        let encoded =
+            super::super::encoder::encode(&mapped.packet).expect("empty histogram should encode");
         assert!(!encoded.is_empty());
     }
 
@@ -1388,7 +1616,6 @@ mod tests {
             .map(|index| string_attribute(&format!("dimension-{index}"), "value"))
             .collect::<Vec<_>>();
         excessive_dimensions.extend([
-            string_attribute(ACCOUNT_ATTRIBUTE, "late-account"),
             string_attribute(NAMESPACE_ATTRIBUTE, "late-namespace"),
             overflow_attribute.clone(),
         ]);
@@ -1404,17 +1631,16 @@ mod tests {
             .expect("request should map");
 
         assert_eq!(mapped.rejected_data_points, 2);
-        assert!(mapped.publications.is_empty());
+        assert!(mapped.packet.metrics.is_empty());
         assert_eq!(mapped.cardinality_overflows.len(), 2);
         assert_eq!(
             mapped.cardinality_overflows[0].metric_name,
             "invalid-dimension"
         );
         assert_eq!(
-            mapped.cardinality_overflows[0].monitoring_account,
-            "late-account"
+            &*mapped.cardinality_overflows[0].namespace,
+            "late-namespace"
         );
-        assert_eq!(mapped.cardinality_overflows[0].namespace, "late-namespace");
         assert!(mapped.cardinality_overflows[1].metric_name.is_empty());
     }
 
@@ -1430,13 +1656,10 @@ mod tests {
             scope_with_metrics(vec![gauge_metric("resource-invalid", overflow_point())]);
         let resource_mapped = map_request(
             &request(
-                vec![
-                    string_attribute(
-                        "invalid-resource",
-                        &"x".repeat(MAX_DIMENSION_VALUE_UTF16_UNITS + 1),
-                    ),
-                    string_attribute(ACCOUNT_ATTRIBUTE, "later-account"),
-                ],
+                vec![string_attribute(
+                    "invalid-resource",
+                    &"x".repeat(MAX_DIMENSION_VALUE_UTF16_UNITS + 1),
+                )],
                 resource_scope,
             ),
             &resource_config,
@@ -1480,17 +1703,13 @@ mod tests {
         .expect("request should map");
 
         assert_eq!(resource_mapped.rejected_data_points, 1);
-        assert_eq!(
-            resource_mapped.cardinality_overflows[0].monitoring_account,
-            "later-account"
-        );
         assert_eq!(scope_mapped.rejected_data_points, 1);
         assert_eq!(
-            scope_mapped.cardinality_overflows[0].namespace,
+            &*scope_mapped.cardinality_overflows[0].namespace,
             "resource-namespace"
         );
         assert_eq!(empty_name_mapped.rejected_data_points, 0);
-        assert_eq!(empty_name_mapped.publications[0].packet.metrics[0].name, "");
+        assert_eq!(empty_name_mapped.packet.metrics[0].name, "");
         assert_eq!(empty_name_mapped.cardinality_overflows[0].metric_name, "");
     }
 
@@ -1511,58 +1730,15 @@ mod tests {
             .expect("request should map");
 
         assert_eq!(mapped.rejected_data_points, 1);
-        assert_eq!(mapped.publications.len(), 1);
-        assert_eq!(mapped.publications[0].packet.metrics.len(), 2);
-        assert_eq!(mapped.publications[0].packet.metrics[0].name, "");
-        assert_eq!(mapped.publications[0].packet.metrics[1].name, accepted);
+        assert_eq!(mapped.packet.metrics.len(), 2);
+        assert_eq!(mapped.packet.metrics[0].name, "");
+        assert_eq!(mapped.packet.metrics[1].name, accepted);
     }
 
-    /// Scenario: Points alternate among many monitoring accounts and later return to an earlier account.
-    /// Guarantees: Indexed grouping preserves first-seen publication order and appends metrics to the matching packet.
+    /// Scenario: Destination namespaces cover every banned namespace plus case-only variants.
+    /// Guarantees: The mapper uses an exact case-sensitive namespace deny list.
     #[test]
-    fn groups_publications_in_first_seen_order() {
-        let account_point =
-            |account: &str| gauge_point(vec![string_attribute(ACCOUNT_ATTRIBUTE, account)]);
-        let scope = scope_with_metrics(vec![
-            gauge_metric("a-first", account_point("account-a")),
-            gauge_metric("b", account_point("account-b")),
-            gauge_metric("c", account_point("account-c")),
-            gauge_metric("a-second", account_point("account-a")),
-        ]);
-
-        let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
-            .expect("request should map");
-
-        assert_eq!(mapped.rejected_data_points, 0);
-        assert_eq!(
-            mapped
-                .publications
-                .iter()
-                .map(|publication| publication.monitoring_account.as_str())
-                .collect::<Vec<_>>(),
-            vec!["account-a", "account-b", "account-c"]
-        );
-        assert_eq!(
-            mapped.publications[0]
-                .packet
-                .metrics
-                .iter()
-                .map(|metric| metric.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a-first", "a-second"]
-        );
-    }
-
-    /// Scenario: Destination names cover every banned account and namespace plus case-only variants.
-    /// Guarantees: The mapper uses exact case-sensitive destination deny lists.
-    #[test]
-    fn matches_banned_destination_lists() {
-        for account in BANNED_MONITORING_ACCOUNTS {
-            assert!(is_banned_monitoring_account(account));
-        }
-        for account in ["default", "<Unknown>", "mdm account"] {
-            assert!(!is_banned_monitoring_account(account));
-        }
+    fn matches_banned_namespace_destination_list() {
         for namespace in BANNED_METRIC_NAMESPACES {
             assert!(is_banned_metric_namespace(namespace));
         }
@@ -1575,52 +1751,35 @@ mod tests {
         }
     }
 
-    /// Scenario: Overflow-marked points target empty, banned, and case-variant account and namespace names.
-    /// Guarantees: Banned destinations are rejected after diagnostics are recorded while case-only variants remain publishable.
+    /// Scenario: Overflow-marked points target empty, banned, and case-variant namespace names.
+    /// Guarantees: A banned namespace is rejected after diagnostics are recorded while case-only variants remain publishable.
     #[test]
-    fn rejects_banned_destinations_after_overflow_diagnostics() {
-        let point = |account: &str, namespace: &str| {
+    fn rejects_banned_namespace_after_overflow_diagnostics() {
+        let point = |namespace: &str| {
             gauge_point(vec![
-                string_attribute(ACCOUNT_ATTRIBUTE, account),
                 string_attribute(NAMESPACE_ATTRIBUTE, namespace),
                 bool_attribute("otel.metric.overflow", true),
             ])
         };
         let scope = scope_with_metrics(vec![
-            gauge_metric("empty-account", point("", "allowed")),
-            gauge_metric("banned-account", point("Default", "allowed")),
-            gauge_metric(
-                "banned-namespace",
-                point("allowed-account", "MetricsExtension"),
-            ),
-            gauge_metric("case-variants", point("default", "metricsextension")),
+            gauge_metric("banned-namespace", point("MetricsExtension")),
+            gauge_metric("case-variant", point("metricsextension")),
         ]);
 
         let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
             .expect("request should map");
 
-        assert_eq!(mapped.rejected_data_points, 3);
-        assert_eq!(mapped.publications.len(), 1);
-        assert_eq!(mapped.publications[0].monitoring_account, "default");
-        assert_eq!(
-            mapped.publications[0].packet.metrics[0].namespace,
-            "metricsextension"
-        );
+        assert_eq!(mapped.rejected_data_points, 1);
+        assert_eq!(&*mapped.packet.metrics[0].namespace, "metricsextension");
         assert_eq!(
             mapped
                 .cardinality_overflows
                 .iter()
-                .map(|overflow| (
-                    overflow.monitoring_account.as_str(),
-                    overflow.namespace.as_str(),
-                    overflow.metric_name.as_str(),
-                ))
+                .map(|overflow| (&*overflow.namespace, overflow.metric_name.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                ("", "allowed", "empty-account"),
-                ("Default", "allowed", "banned-account"),
-                ("allowed-account", "MetricsExtension", "banned-namespace",),
-                ("default", "metricsextension", "case-variants"),
+                ("MetricsExtension", "banned-namespace"),
+                ("metricsextension", "case-variant"),
             ]
         );
     }
@@ -1671,7 +1830,7 @@ mod tests {
 
         let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
             .expect("request should map");
-        let metric = &mapped.publications[0].packet.metrics[0];
+        let metric = &mapped.packet.metrics[0];
         let MetricValues::Double(values) = &metric.values else {
             panic!("histogram should use double values");
         };
@@ -1680,7 +1839,7 @@ mod tests {
         };
 
         assert_eq!(histogram.scale, -12);
-        let _ = super::super::encoder::encode(&mapped.publications[0].packet)
+        let _ = super::super::encoder::encode(&mapped.packet)
             .expect("downscaled histogram should encode");
     }
 
@@ -1723,7 +1882,7 @@ mod tests {
         };
         let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
             .expect("request should map");
-        let metric = &mapped.publications[0].packet.metrics[0];
+        let metric = &mapped.packet.metrics[0];
 
         assert_eq!(mapped.rejected_data_points, 0);
         let exemplar_size =
@@ -1734,8 +1893,8 @@ mod tests {
             super::super::encoder::exemplar::MAX_EXEMPLAR_PAYLOAD_SIZE / exemplar_size
         );
         assert_ne!(metric.sampling_type & EXEMPLAR, 0);
-        let _ = super::super::encoder::encode(&mapped.publications[0].packet)
-            .expect("bounded exemplars should encode");
+        let _ =
+            super::super::encoder::encode(&mapped.packet).expect("bounded exemplars should encode");
     }
 
     /// Scenario: Exemplar mapping is disabled while an OTLP point carries a valid exemplar.
@@ -1833,10 +1992,10 @@ mod tests {
             .expect("request should map");
 
         assert_eq!(mapped.rejected_data_points, 3);
-        assert!(mapped.publications.is_empty());
+        assert!(mapped.packet.metrics.is_empty());
     }
 
-    /// Scenario: A serialized OTLP gauge request is decoded, mapped, and serialized as protocol v6.
+    /// Scenario: A serialized OTLP gauge request is read through the raw byte view, mapped, and serialized as protocol v6.
     /// Guarantees: The complete local OTLP-to-packet path produces a non-empty packet with one metric.
     #[test]
     fn decodes_and_encodes_otlp_request() {
@@ -1860,34 +2019,16 @@ mod tests {
             }],
             schema_url: String::new(),
         };
-        let mut bytes = Vec::new();
-        request(Vec::new(), scope)
-            .encode(&mut bytes)
-            .expect("request should encode");
+        let mapped = map_request(&request(Vec::new(), scope), &config(), TEST_TIME_NANOS)
+            .expect("request should map");
+        let encoded = super::super::encoder::encode(&mapped.packet).expect("packet should encode");
 
-        let mapped =
-            decode_and_map(&bytes, &config(), TEST_TIME_NANOS).expect("request should map");
-        let encoded = super::super::encoder::encode(&mapped.publications[0].packet)
-            .expect("packet should encode");
-
-        assert_eq!(mapped.publications[0].packet.metrics.len(), 1);
+        assert_eq!(mapped.packet.metrics.len(), 1);
         assert!(!encoded.is_empty());
     }
 
-    /// Scenario: Known fields use invalid protobuf wire types at the request and nested resource levels.
-    /// Guarantees: The public byte entry point rejects malformed OTLP instead of returning an empty or partial outcome.
-    #[test]
-    fn rejects_malformed_nested_otlp_requests() {
-        for malformed in [&[0x08, 0x01][..], &[0x0a, 0x02, 0x08, 0x01][..]] {
-            assert!(matches!(
-                decode_and_map(malformed, &config(), TEST_TIME_NANOS),
-                Err(MappingError::Decode(_))
-            ));
-        }
-    }
-
-    /// Scenario: Equivalent metrics with all-zero exemplar IDs use strict decoding and all supported pdata views.
-    /// Guarantees: Owned OTLP, raw OTLP, and OTAP mapping agree while invalid zero identifiers are omitted.
+    /// Scenario: Equivalent metrics with all-zero exemplar IDs are mapped from owned OTLP, raw OTLP bytes, and OTAP records.
+    /// Guarantees: All supported pdata views produce the same outcome while invalid zero identifiers are omitted.
     #[test]
     fn maps_all_metrics_view_representations_consistently() {
         let mut point = gauge_point(vec![string_attribute("region", "eastus")]);
@@ -1902,38 +2043,20 @@ mod tests {
             vec![string_attribute("resource", "value")],
             scope_with_metrics(vec![gauge_metric("temperature", point)]),
         );
-        let owned = map_request(&request, &config(), TEST_TIME_NANOS)
-            .expect("owned OTLP request should map");
+        let raw =
+            map_request(&request, &config(), TEST_TIME_NANOS).expect("raw OTLP request should map");
 
-        let mut bytes = Vec::new();
-        request
-            .encode(&mut bytes)
-            .expect("OTLP request should encode");
-        let decoded = decode_and_map(&bytes, &config(), TEST_TIME_NANOS)
-            .expect("strictly decoded OTLP request should map");
-        let raw_view =
-            RawMetricsData::try_new(&bytes).expect("serialized OTLP request should be framed");
-        let raw = map_metrics(&raw_view, &config(), TEST_TIME_NANOS)
-            .expect("raw OTLP request should map");
-
-        let metrics = MetricsData {
-            resource_metrics: request.resource_metrics.clone(),
-        };
+        let metrics = MetricsData::from(request);
+        let owned = map_metrics(&metrics, &config(), TEST_TIME_NANOS)
+            .expect("owned OTLP metrics should map");
         let records = otlp_to_otap(&OtlpProtoMessage::Metrics(metrics));
         let view = OtapMetricsView::try_from(&records).expect("OTAP metrics view should build");
         let otap =
             map_metrics(&view, &config(), TEST_TIME_NANOS).expect("OTAP metrics view should map");
 
-        assert_eq!(decoded, owned);
         assert_eq!(raw, owned);
         assert_eq!(otap, owned);
-        assert_eq!(
-            owned.publications[0].packet.metrics[0].exemplars[0].trace_id,
-            None
-        );
-        assert_eq!(
-            owned.publications[0].packet.metrics[0].exemplars[0].span_id,
-            None
-        );
+        assert_eq!(owned.packet.metrics[0].exemplars[0].trace_id, None);
+        assert_eq!(owned.packet.metrics[0].exemplars[0].span_id, None);
     }
 }

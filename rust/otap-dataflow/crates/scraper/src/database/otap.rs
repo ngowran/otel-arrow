@@ -3,11 +3,10 @@
 
 //! Shared typed database-row to OTLP log conversion.
 
-use super::page::{CompositeCursor, CursorRow, QueryPage};
+use super::page::{Cursor, CursorRow, QueryPage};
 use super::{CellValue, ColumnMetadata, DatabaseSystem, OutputConfig, Row};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use otel_arrow_dfe_otap::pdata::OtapPdata;
-use otel_arrow_dfe_pdata::OtapPayload;
 use otel_arrow_dfe_pdata::otlp::OtlpProtoBytes;
 use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
     AnyValue, InstrumentationScope, KeyValue, KeyValueList, any_value,
@@ -16,6 +15,7 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
     LogRecord, LogsData, ResourceLogs, ScopeLogs, SeverityNumber,
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
+use otel_arrow_dfe_pdata_codec::OtapPayload;
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
@@ -239,6 +239,13 @@ impl OtlpPageEncoder {
         let mut records_wire_bytes = 0_usize;
         let mut event_time_fallbacks = 0_usize;
         let total_rows = rows.len();
+        let snapshot = matches!(rows[0].cursor, Cursor::Snapshot);
+        if rows
+            .iter()
+            .any(|row| matches!(row.cursor, Cursor::Snapshot) != snapshot)
+        {
+            return Err(OtlpMappingError::MixedSnapshotCursors);
+        }
 
         for cursor_row in rows {
             let (record, used_event_time_fallback) = row_to_record(
@@ -264,6 +271,11 @@ impl OtlpPageEncoder {
                 .saturating_add(prost::encoding::encoded_len_varint(resource_bytes as u64))
                 .saturating_add(resource_bytes);
             if u64::try_from(candidate_size).unwrap_or(u64::MAX) > max_batch_bytes {
+                if snapshot {
+                    return Err(OtlpMappingError::SnapshotByteLimit {
+                        limit: max_batch_bytes,
+                    });
+                }
                 if records.is_empty() {
                     return Err(OtlpMappingError::OversizedFirstRow {
                         encoded_bytes: candidate_size,
@@ -307,7 +319,7 @@ pub struct EncodedPage {
     /// Serialized OTLP logs payload.
     pub pdata: OtapPdata,
     /// Cursor of the last row actually included in `pdata`.
-    pub candidate: CompositeCursor,
+    pub candidate: Cursor,
     /// Number of database rows encoded into `pdata`.
     pub row_count: usize,
     /// Exact serialized size of `pdata`.
@@ -333,9 +345,10 @@ impl fmt::Debug for EncodedPage {
     }
 }
 
-/// Encodes the largest non-empty row prefix that fits `max_batch_bytes`.
+/// Encodes a complete snapshot or the largest fitting non-empty keyset prefix.
 ///
-/// Rows beyond the ceiling are deferred to the next poll rather than dropped,
+/// Snapshots must fit in full; an oversized snapshot returns an error with no
+/// partial payload. For keysets, rows beyond the ceiling are deferred rather than dropped,
 /// and the returned candidate always comes from the last row actually encoded.
 /// An empty page returns `None`; a first row that alone exceeds the ceiling is
 /// an explicit error so no row is silently skipped.
@@ -504,6 +517,15 @@ fn int_value(value: i64) -> AnyValue {
 /// Database-row to OTLP conversion failure.
 #[derive(Debug, thiserror::Error)]
 pub enum OtlpMappingError {
+    /// A snapshot cannot defer a row prefix without a resumable position.
+    #[error("complete snapshot exceeds the {limit}-byte query.max_batch_bytes limit")]
+    SnapshotByteLimit {
+        /// Configured serialized-byte ceiling.
+        limit: u64,
+    },
+    /// A page mixed no-position markers with ordered source positions.
+    #[error("snapshot and keyset cursors cannot be mixed in one page")]
+    MixedSnapshotCursors,
     /// Live metadata contains duplicate normalized names.
     #[error("result metadata contains duplicate column '{name}'")]
     DuplicateColumn {
@@ -563,7 +585,7 @@ pub enum OtlpMappingError {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
-    use otel_arrow_dfe_pdata::PayloadData;
+    use otel_arrow_dfe_pdata_codec::PdataEncoding;
 
     fn columns() -> Vec<ColumnMetadata> {
         vec![ColumnMetadata {
@@ -592,7 +614,7 @@ mod cache_tests {
                     row: Row {
                         values: vec![value],
                     },
-                    cursor: CompositeCursor::new("2026-01-01T00:00:00Z".to_owned(), 1),
+                    cursor: Cursor::composite("2026-01-01T00:00:00Z".to_owned(), 1),
                 })
                 .collect(),
         }
@@ -722,11 +744,13 @@ mod cache_tests {
                 .expect("encode")
                 .expect("one row");
             let expected = encoder.logs.encode_to_vec();
-            let PayloadData::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(actual)) =
-                encoded.pdata.payload().into_data()
-            else {
-                panic!("OTLP logs bytes");
-            };
+            let payload = encoded.pdata.payload_ref();
+            assert_eq!(payload.encoding(), Some(&PdataEncoding::OTLP));
+            assert_eq!(
+                payload.signal_type(),
+                otel_arrow_dfe_config::SignalType::Logs
+            );
+            let actual = payload.encoded_bytes().expect("OTLP bytes");
             assert_eq!(encoded.encoded_bytes, expected.len());
             assert_eq!(actual.as_ref(), expected.as_slice());
         }

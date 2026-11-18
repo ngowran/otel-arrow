@@ -11,43 +11,54 @@ pub(super) const MIN_EXPONENTIAL_SCALE: i32 = -11;
 pub(super) const MAX_EXPONENTIAL_SCALE: i32 = 20;
 const MAX_EXPONENTIAL_BUCKETS: usize = 502;
 
-pub(super) fn valid_explicit_histogram<P>(point: &P) -> bool
-where
-    P: HistogramDataPointView,
-{
-    let mut bound_count = 0;
-    for bound in point.explicit_bounds() {
-        if bound.is_nan() {
-            return false;
-        }
-        bound_count += 1;
-    }
-    bound_count == 0 || point.bucket_counts().count() > bound_count
+/// Outcome of parsing an OTLP explicit histogram's bucket distribution.
+#[derive(Debug, PartialEq)]
+pub(super) enum ExplicitHistogram {
+    /// Too few bucket counts for the bounds, or a NaN bound; the data point must be rejected.
+    Invalid,
+    /// No bucket distribution was present (scalar count/sum only).
+    Empty,
+    /// A valid bucket distribution.
+    Buckets(MetricHistogram),
 }
 
-pub(super) fn explicit_histogram<P>(point: &P) -> Option<MetricHistogram>
+/// Validates and builds an explicit histogram's bucket distribution
+pub(super) fn explicit_histogram<P>(point: &P) -> ExplicitHistogram
 where
     P: HistogramDataPointView,
 {
     let mut counts = point.bucket_counts();
-    let first_count = counts.next()?;
     let bounds = point.explicit_bounds();
     let mut buckets = Vec::with_capacity(bounds.size_hint().0 + 1);
-    let mut current_count = Some(first_count);
+    // Matches the existing behavior of using the last bound plus one for the synthetic
+    // overflow bucket, or 1.0 when there is no last bound.
     let mut overflow_bound = 1.0;
     for bound in bounds {
+        // Unlike existing behavior, NaN bounds are rejected because they cannot be sorted.
         if bound.is_nan() {
-            return None;
+            return ExplicitHistogram::Invalid;
         }
-        let count = current_count.take()?;
+        // Matches existing behavior of rejecting points with fewer counts than bounds plus one.
+        let Some(count) = counts.next() else {
+            return ExplicitHistogram::Invalid;
+        };
         buckets.push((bound, clamp_bucket_count(count)));
         overflow_bound = bound + 1.0;
-        current_count = counts.next();
     }
-    let overflow_count = current_count?;
+    let Some(overflow_count) = counts.next() else {
+        // Matches existing behavior: no bounds and no counts means no distribution, while
+        // bounds without an overflow count reject the point.
+        return if buckets.is_empty() {
+            ExplicitHistogram::Empty
+        } else {
+            ExplicitHistogram::Invalid
+        };
+    };
+    // Matches existing behavior: with no bounds the first count is used, extra counts are
+    // ignored, and the total is not checked against count.
     buckets.push((overflow_bound, clamp_bucket_count(overflow_count)));
     normalize_explicit_buckets(&mut buckets);
-    Some(MetricHistogram::Explicit(buckets))
+    ExplicitHistogram::Buckets(MetricHistogram::Explicit(buckets))
 }
 
 fn clamp_bucket_count(count: u64) -> u32 {
@@ -64,6 +75,7 @@ fn normalize_explicit_buckets(buckets: &mut Vec<(f64, u32)>) {
     for read_index in 0..buckets.len() {
         let (bound, count) = buckets[read_index];
         if write_index > 0 && buckets[write_index - 1].0 == bound {
+            // Note: wrapping_add is specified/intentional behavior.
             buckets[write_index - 1].1 = buckets[write_index - 1].1.wrapping_add(count);
         } else {
             buckets[write_index] = (bound, count);
@@ -138,11 +150,7 @@ mod tests {
 
     use super::*;
 
-    fn valid_explicit_histogram(point: &HistogramDataPoint) -> bool {
-        super::valid_explicit_histogram(&ObjHistogramDataPoint::new(point))
-    }
-
-    fn explicit_histogram(point: &HistogramDataPoint) -> Option<MetricHistogram> {
+    fn explicit_histogram(point: &HistogramDataPoint) -> ExplicitHistogram {
         super::explicit_histogram(&ObjHistogramDataPoint::new(point))
     }
 
@@ -152,10 +160,11 @@ mod tests {
         super::sparse_buckets(buckets.map(ObjBuckets::new))
     }
 
-    fn explicit_point(bounds: Vec<f64>, counts: Vec<u64>) -> HistogramDataPoint {
+    fn explicit_point(bounds: Vec<f64>, counts: Vec<u64>, count: u64) -> HistogramDataPoint {
         HistogramDataPoint {
             explicit_bounds: bounds,
             bucket_counts: counts,
+            count,
             ..Default::default()
         }
     }
@@ -170,73 +179,68 @@ mod tests {
         }
     }
 
-    /// Scenario: Explicit histogram bucket counts omit, include, or exceed the required overflow bucket.
-    /// Guarantees: Missing overflow counts are rejected, and counts beyond the first overflow bucket are ignored.
+    /// Scenario: Explicit histogram bucket counts omit, exactly match, or exceed the required overflow bucket.
+    /// Guarantees: Missing overflow counts are rejected, a correctly sized count array is mapped, and counts
+    /// beyond the required overflow bucket are ignored to match existing behavior.
     #[test]
     fn validates_explicit_histogram_bucket_shape() {
-        assert!(!valid_explicit_histogram(&explicit_point(
-            vec![1.0, 2.0],
-            vec![3, 4],
-        )));
-        assert!(valid_explicit_histogram(&explicit_point(
-            vec![1.0, 2.0],
-            vec![3, 4, 5],
-        )));
-        let extra_counts = explicit_point(vec![1.0, 2.0], vec![3, 4, 5, 999]);
-        assert!(valid_explicit_histogram(&extra_counts));
+        let expected = ExplicitHistogram::Buckets(MetricHistogram::Explicit(vec![
+            (1.0, 3),
+            (2.0, 4),
+            (3.0, 5),
+        ]));
         assert_eq!(
-            explicit_histogram(&extra_counts),
-            Some(MetricHistogram::Explicit(vec![
-                (1.0, 3),
-                (2.0, 4),
-                (3.0, 5),
-            ]))
+            explicit_histogram(&explicit_point(vec![1.0, 2.0], vec![3, 4], 7)),
+            ExplicitHistogram::Invalid
         );
-    }
-
-    /// Scenario: An explicit histogram contains finite bounds and an overflow bucket.
-    /// Guarantees: Bounds and counts map in order and the overflow bucket receives a synthetic final bound.
-    #[test]
-    fn maps_explicit_histogram_with_overflow_bucket() {
-        let histogram = explicit_histogram(&explicit_point(vec![1.0, 2.0], vec![3, 4, 5]));
-
         assert_eq!(
-            histogram,
-            Some(MetricHistogram::Explicit(vec![
-                (1.0, 3),
-                (2.0, 4),
-                (3.0, 5),
-            ]))
+            explicit_histogram(&explicit_point(vec![1.0, 2.0], vec![3, 4, 5], 12)),
+            expected
         );
+        let extra_counts = explicit_point(vec![1.0, 2.0], vec![3, 4, 5, 999], 12);
+        assert_eq!(explicit_histogram(&extra_counts), expected);
     }
 
     /// Scenario: Explicit histogram bounds are unordered, duplicated, and share a bound with the synthetic overflow bucket.
     /// Guarantees: Buckets are sorted and equal boundaries are coalesced using protocol-compatible count addition.
     #[test]
     fn sorts_and_coalesces_explicit_histogram_buckets() {
+        let huge_bound = 1.0e300;
         let histogram = explicit_histogram(&explicit_point(
-            vec![3.0, 1.0, 1.0, f64::MAX],
+            vec![3.0, 1.0, 1.0, huge_bound],
             vec![1, 2, 3, 4, 5],
+            15,
         ));
 
         assert_eq!(
             histogram,
-            Some(MetricHistogram::Explicit(vec![
+            ExplicitHistogram::Buckets(MetricHistogram::Explicit(vec![
                 (1.0, 5),
                 (3.0, 1),
-                (f64::MAX, 9),
+                (huge_bound, 9),
             ]))
         );
     }
 
+    /// Scenario: An explicit histogram's last bound is so large that adding one leaves it unchanged.
+    /// Guarantees: The overflow count is merged into the final bucket to match Metrics Extension behavior.
+    #[test]
+    fn coalesces_explicit_histogram_overflow_at_max_bound() {
+        let histogram = explicit_histogram(&explicit_point(vec![f64::MAX], vec![1, 2], 3));
+
+        assert_eq!(
+            histogram,
+            ExplicitHistogram::Buckets(MetricHistogram::Explicit(vec![(f64::MAX, 3)]))
+        );
+    }
+
     /// Scenario: An explicit histogram includes a NaN bound among otherwise valid bounds.
-    /// Guarantees: Malformed input is rejected before the quadratic insertion fallback can run.
+    /// Guarantees: NaN bounds are rejected before sorting, which would otherwise panic.
     #[test]
     fn rejects_nan_explicit_histogram_bounds() {
-        let point = explicit_point(vec![1.0, f64::NAN, 2.0], vec![1, 2, 3, 4]);
+        let point = explicit_point(vec![1.0, f64::NAN, 2.0], vec![1, 2, 3, 4], 10);
 
-        assert!(!valid_explicit_histogram(&point));
-        assert_eq!(explicit_histogram(&point), None);
+        assert_eq!(explicit_histogram(&point), ExplicitHistogram::Invalid);
     }
 
     /// Scenario: Explicit histogram bucket counts exceed the Geneva u32 representation.
@@ -244,14 +248,32 @@ mod tests {
     #[test]
     fn clamps_explicit_histogram_bucket_counts() {
         let oversized = u64::from(u32::MAX) + 1;
-        let histogram = explicit_histogram(&explicit_point(vec![1.0], vec![oversized, u64::MAX]));
+        let histogram = explicit_histogram(&explicit_point(
+            vec![1.0],
+            vec![oversized, oversized],
+            oversized * 2,
+        ));
 
         assert_eq!(
             histogram,
-            Some(MetricHistogram::Explicit(vec![
+            ExplicitHistogram::Buckets(MetricHistogram::Explicit(vec![
                 (1.0, u32::MAX),
                 (2.0, u32::MAX),
             ]))
+        );
+    }
+
+    /// Scenario: Explicit histogram bucket counts disagree with the point count or sum to more than a u64.
+    /// Guarantees: The buckets are still mapped, matching existing behavior of not checking bucket totals.
+    #[test]
+    fn does_not_check_explicit_bucket_total() {
+        assert_eq!(
+            explicit_histogram(&explicit_point(vec![1.0], vec![1, 2], 99)),
+            ExplicitHistogram::Buckets(MetricHistogram::Explicit(vec![(1.0, 1), (2.0, 2)]))
+        );
+        assert_eq!(
+            explicit_histogram(&explicit_point(vec![1.0], vec![u64::MAX, 1], u64::MAX)),
+            ExplicitHistogram::Buckets(MetricHistogram::Explicit(vec![(1.0, u32::MAX), (2.0, 1)]))
         );
     }
 
@@ -260,8 +282,34 @@ mod tests {
     #[test]
     fn omits_empty_explicit_histogram() {
         assert_eq!(
-            explicit_histogram(&explicit_point(Vec::new(), Vec::new())),
-            None
+            explicit_histogram(&explicit_point(Vec::new(), Vec::new(), 0)),
+            ExplicitHistogram::Empty
+        );
+    }
+
+    /// Scenario: An explicit histogram data point has no configured bounds but reports a single bucket count.
+    /// Guarantees: The lone count is treated as a synthetic single-bucket distribution rather than discarded.
+    #[test]
+    fn maps_unbounded_explicit_histogram_single_bucket() {
+        assert_eq!(
+            explicit_histogram(&explicit_point(Vec::new(), vec![7], 7)),
+            ExplicitHistogram::Buckets(MetricHistogram::Explicit(vec![(1.0, 7)]))
+        );
+    }
+
+    /// Scenario: An explicit histogram data point has no configured bounds but reports extra counts or a
+    /// mismatched point count.
+    /// Guarantees: Only the first count is used as the synthetic bucket, matching existing behavior.
+    #[test]
+    fn uses_first_count_for_unbounded_explicit_histogram() {
+        let expected = ExplicitHistogram::Buckets(MetricHistogram::Explicit(vec![(1.0, 7)]));
+        assert_eq!(
+            explicit_histogram(&explicit_point(Vec::new(), vec![7, 1], 8)),
+            expected
+        );
+        assert_eq!(
+            explicit_histogram(&explicit_point(Vec::new(), vec![7], 99)),
+            expected
         );
     }
 

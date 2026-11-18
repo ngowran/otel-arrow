@@ -92,12 +92,22 @@ impl ControlPlane for MockControlPlane {
         &self,
         request: EngineConfigReconcileRequest,
     ) -> Result<EngineConfigReconcileStatus, ControlPlaneError> {
-        *self.current_config.lock().unwrap() = request.config;
-        self.reconcile_result.lock().unwrap().clone()
+        let result = self.reconcile_result.lock().unwrap().clone();
+        if matches!(
+            result,
+            Ok(ref status) if status.state == EngineConfigReconcileState::Succeeded
+        ) {
+            *self.current_config.lock().unwrap() = request.config;
+        }
+        result
     }
 
     fn shutdown_all(&self, _timeout_secs: u64) -> Result<(), ControlPlaneError> {
         Err(not_implemented())
+    }
+
+    fn has_active_instances(&self) -> bool {
+        false
     }
 
     fn shutdown_pipeline(

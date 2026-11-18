@@ -5,6 +5,20 @@
 
 use serde::Deserialize;
 
+const BANNED_MONITORING_ACCOUNTS: &[&str] = &[
+    "%MDM_MONITORING_ACCOUNT%",
+    "%MONITORING_MDM_ACCOUNT_NAME%",
+    "!AZUREDB_METRICS_ACCOUNT!",
+    "!AZUREDB_SHOEBOX_METRICS_ACCOUNT!",
+    "<unknown>",
+    "Default",
+    "MDM ACCOUNT",
+    "<monitoringAccountPlaceholder>",
+    "*",
+    "{{AccountName}}",
+    "<<Metric Account Name>>",
+];
+
 /// Scope attribute selection for one instrumentation scope name.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +33,10 @@ pub struct ScopeAttributes {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Conservative per-input mapping allocation budget in bytes.
+    #[serde(default = "default_max_mapping_bytes")]
+    pub max_mapping_bytes: usize,
+
     /// Monitoring account receiving the metrics.
     pub monitoring_account: String,
 
@@ -26,18 +44,23 @@ pub struct Config {
     pub metric_namespace: String,
 
     /// Resource attribute keys to add as dimensions, or `*` for all attributes.
+    /// Non-string attribute values become empty dimension values.
     #[serde(default)]
     pub resource_attributes: Vec<String>,
 
-    /// Whether resource dimensions override point and scope dimensions.
+    /// Whether resource dimensions override point dimensions. Scope dimensions
+    /// still win when `honor_scope_attributes` is also enabled.
     #[serde(default)]
     pub honor_resource_attributes: bool,
 
-    /// Scope-specific attribute keys to add as dimensions.
+    /// Scope-specific attribute keys to add as dimensions. The first entry
+    /// named `*` applies to every scope and replaces all other entries.
+    /// Non-string attribute values become empty dimension values.
     #[serde(default)]
     pub scope_attributes: Vec<ScopeAttributes>,
 
-    /// Whether scope dimensions override point and resource dimensions.
+    /// Whether scope dimensions override point and resource dimensions. This
+    /// takes precedence over `honor_resource_attributes`.
     #[serde(default)]
     pub honor_scope_attributes: bool,
 
@@ -49,8 +72,17 @@ pub struct Config {
 impl Config {
     /// Validates the mapping configuration.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_mapping_bytes == 0 {
+            return Err("max_mapping_bytes must be greater than zero".to_string());
+        }
         if self.monitoring_account.trim().is_empty() {
             return Err("monitoring_account must not be empty".to_string());
+        }
+        if BANNED_MONITORING_ACCOUNTS.contains(&self.monitoring_account.as_str()) {
+            return Err(format!(
+                "monitoring_account {:?} is a reserved placeholder and cannot be used",
+                self.monitoring_account
+            ));
         }
         if self.metric_namespace.trim().is_empty() {
             return Err("metric_namespace must not be empty".to_string());
@@ -64,6 +96,10 @@ impl Config {
         }
         Ok(())
     }
+}
+
+pub(crate) fn default_max_mapping_bytes() -> usize {
+    super::DEFAULT_MAX_MAPPING_BYTES
 }
 
 #[cfg(test)]
@@ -82,6 +118,7 @@ mod tests {
             scope_attributes: Vec::new(),
             honor_scope_attributes: false,
             disable_exemplars: false,
+            max_mapping_bytes: default_max_mapping_bytes(),
         };
 
         assert_eq!(config.validate(), Ok(()));
@@ -99,12 +136,33 @@ mod tests {
             scope_attributes: Vec::new(),
             honor_scope_attributes: false,
             disable_exemplars: false,
+            max_mapping_bytes: default_max_mapping_bytes(),
         };
 
         assert_eq!(
             config.validate(),
             Err("monitoring_account must not be empty".to_string())
         );
+    }
+
+    /// Scenario: A configuration's monitoring account is a reserved placeholder value.
+    /// Guarantees: OTLP metrics cannot be mapped to a monitoring account known to be invalid.
+    #[test]
+    fn rejects_banned_monitoring_account() {
+        for account in BANNED_MONITORING_ACCOUNTS {
+            let config = Config {
+                monitoring_account: (*account).to_string(),
+                metric_namespace: "example-namespace".to_string(),
+                resource_attributes: Vec::new(),
+                honor_resource_attributes: false,
+                scope_attributes: Vec::new(),
+                honor_scope_attributes: false,
+                disable_exemplars: false,
+                max_mapping_bytes: default_max_mapping_bytes(),
+            };
+
+            assert!(config.validate().is_err());
+        }
     }
 
     /// Scenario: A configuration omits the fallback metric namespace.
@@ -119,6 +177,7 @@ mod tests {
             scope_attributes: Vec::new(),
             honor_scope_attributes: false,
             disable_exemplars: false,
+            max_mapping_bytes: default_max_mapping_bytes(),
         };
 
         assert_eq!(
@@ -142,6 +201,7 @@ mod tests {
             }],
             honor_scope_attributes: false,
             disable_exemplars: false,
+            max_mapping_bytes: default_max_mapping_bytes(),
         };
 
         assert_eq!(

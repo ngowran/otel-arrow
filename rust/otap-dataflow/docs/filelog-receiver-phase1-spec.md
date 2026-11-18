@@ -260,7 +260,7 @@ groups:
 | `rotation.on_truncate` | `fail` | `fail` durably quarantines; `read_new` accepts an explicit reported gap and continues at epoch-reset offset zero |
 | `checkpoint.id` | Derived logical receiver key | Optional stable namespace name of 1 to 127 ASCII bytes; set explicitly to preserve continuity across logical-key renames |
 | `checkpoint.sync_interval` | `0s` | Zero syncs every Ack transaction before release; nonzero permits rereading/reframing and, after storage/power failure, possible fail-closed recovery of a damaged unsynced WAL region |
-| `checkpoint.compact_after_bytes` | `64MiB` | Complete-WAL byte threshold, including the 56-byte header; at least one maximum transaction plus the header |
+| `checkpoint.compact_after_bytes` | `64MiB` | WAL-section byte threshold, excluding the immutable header/snapshot prefix; at least one maximum transaction |
 | `checkpoint.compact_after_transactions` | `10000` | Nonzero transaction threshold |
 | `checkpoint.retention` | `7d` | Continuous runtime-proven absence interval before eligibility; restart or incomplete evidence resets it, zero disables removal, and removal loses durable association |
 | `checkpoint.ownership_timeout` | `30s` | Nonzero bounded ownership wait |
@@ -320,7 +320,7 @@ rename, or an explicit namespace migration. Startup opens only the selected ID. 
 is genuinely absent--directory and artifacts are absent--the receiver runs the
 checkpoint-format first-publication state machine, emits a bounded health
 event, and applies new-file admission policy. Existing artifacts without valid
-`CURRENT` are not an empty namespace. The receiver never searches sibling
+`checkpoint.db` are not an empty namespace. The receiver never searches sibling
 namespaces. Changing the ID therefore selects different existing state or a
 genuinely new namespace and can cause replay or intentional `start_at`
 exclusion.
@@ -442,8 +442,13 @@ rotation:
 ### Structural and relationship validation
 
 Validation completes before threads start or a checkpoint namespace is opened.
-Arithmetic used for counts, byte sums, products, deadlines, and conversions is checked.
-Overflow rejects configuration; values are never wrapped or saturated.
+Arithmetic used for counts, byte sums, products, deadlines, and conversions is
+checked. Overflow rejects configuration; values are never wrapped. The sole
+saturation exception is the intermediate transaction-byte product in the
+[capped WAL bound](#publication-compaction-cleanup-and-recovery): saturation
+is permitted only before taking the minimum with the configured byte threshold.
+It preserves the exact mathematical bound and does not saturate configured
+values, prospective append increments, or subsequent file/recovery sums.
 
 The following relationships are enforced:
 
@@ -465,9 +470,15 @@ The following relationships are enforced:
 15. Exactly zero or one multiline boundary pattern is configured.
 16. `re2-v1` is the only accepted regex profile.
 17. A multiline pattern contains at most 4,096 bytes.
-18. Counted repetition bounds do not exceed 1,000.
-19. Each compiled matcher has a 10 MiB program-size limit.
-20. Each matcher has a 2 MiB lazy-DFA cache limit.
+18. Counted repetition bounds do not exceed 1,000, including nested products.
+    Parsed syntax-tree depth does not exceed 64.
+19. The canonical forward-NFA compiler has a 10 MiB limit. Each compiled matcher
+    also has a provisional 10 MiB aggregate engine-reported
+    program-payload limit, including simultaneously retained forward/reverse
+    programs and prefilters. Allocator and capacity allowances are separate.
+20. Each lazy-DFA cache has a provisional 2 MiB capacity limit. This is not a
+    total worker-memory limit; all caches and fallback scratch require aggregate
+    admission under the [regex execution policy](#regex-execution-policy).
 21. Text patterns compile for validated decoded UTF-8.
 22. Raw patterns compile in non-Unicode byte mode.
 23. Backreferences, look-around, Unicode properties, unsupported set operations,
@@ -503,7 +514,7 @@ The following relationships are enforced:
     or `drop_and_continue`; the former proposed `on_nack` key is not an alias.
 41. `retry.max_backoff >= retry.initial_backoff`.
 42. `checkpoint.compact_after_bytes` is at least
-    `WAL_HEADER_BYTES + WAL_MAX_TX_FRAME_BYTES = 16,777,312` bytes;
+    `WAL_MAX_TX_FRAME_BYTES = 16,777,256` bytes;
     `checkpoint.compact_after_transactions` and the consecutive-failure budget
     are nonzero.
 43. Every UTF-8 input to the derived checkpoint-ID recipe has a length representable
@@ -1274,7 +1285,7 @@ filelog_fd_budget =
 ```
 
 The checkpoint allowance covers the namespace directory and lock, active
-snapshot/WAL, `CURRENT`, and bounded temporary publication descriptors; the
+`checkpoint.db` and a bounded temporary publication descriptor; the
 store must close intermediate handles before exceeding it. Startup rejects a
 receiver-local budget above the process soft `RLIMIT_NOFILE` or platform
 equivalent and emits a warning when it consumes more than 80 percent of that
@@ -1694,7 +1705,11 @@ Every source offset counts original bytes. The processing order is:
 6. construct an OTAP record or fragment; and
 7. attach a progress delta owning the complete frame range.
 
-Text newline and regex framing always follow decoding. Raw mode performs no decoding.
+Text newline and regex framing always follow decoding. With `preserve_raw`, text
+patterns see the decoded line with U+FFFD for malformed units, even when the
+emitted record uses exact source bytes. With `replace`, patterns see that same
+replacement text. With `fail`, malformed input stops decoding before matching.
+Raw-mode patterns inspect source bytes directly, without decoding.
 
 ### Encoding behavior
 
@@ -1870,6 +1885,16 @@ In `seeking`:
 - a complete nonmatching line is emitted under newline framing; and
 - each such fallback increments bounded `pattern_not_matched` telemetry.
 
+Match complete physical lines within `max_line_bytes` even when they exceed
+`max_record_bytes` in seeking state. An unmatched line still counts as one
+fallback when it must split or truncate. Fallback evidence is independent of
+completion reason: byte-limited fragments retain their byte-limit reason, and
+only the first emitted frame carries the fallback observation. Do not count
+both that observation and the completion reason. Stored continuations do not
+reconstruct the original match result or produce another fallback observation.
+Partial lines completed by idle/permanent EOF and oversized physical lines do
+not produce this complete-line fallback evidence.
+
 In `buffering`:
 
 - a nonmatching line is appended with its internal LF;
@@ -1901,17 +1926,103 @@ End-pattern mode begins buffering with the first physical line.
 - Perl classes `\d`, `\s`, `\w`, their negations, and word boundaries use RE2's
   ASCII semantics.
 - Counted repetition limits are at most 1,000.
-- Text patterns run over validated decoded UTF-8.
-- Raw patterns use non-Unicode byte semantics, including exact byte escapes.
+- Text patterns run over decoded UTF-8, including U+FFFD replacements for
+  malformed units under `preserve_raw` or `replace`.
+- Raw patterns use non-Unicode byte semantics. Fixed and braced hex escapes
+  denote bytes (`\xFF` and `\x{FF}` both denote byte `FF`); values above `FF`
+  are rejected in raw mode, including in classes and range endpoints.
+  Literal non-ASCII pattern characters outside character classes use their
+  UTF-8 source bytes. Non-ASCII literals inside raw character classes are
+  rejected; use byte hex escapes for class members and range endpoints.
 - Backreferences and look-around are rejected.
 - Rust-only `u`, `R`, and `x` flags are rejected.
 - Unicode property escapes are rejected.
 - Nested or set-operation character classes outside the profile are rejected.
 - Constructs unsupported by the selected linear-time engine are rejected.
-- Program and cache bounds are enforced at compile time.
+- Program admission and cache reservations are established before source activation.
 
 The receiver compiles defensively as well. A defensive mismatch fails the affected data
 source. It never silently falls back to different regex semantics.
+
+### Regex execution policy
+
+The `re2-v1` profile defines which patterns are supported and what they
+match. Choosing a different execution engine must not change those results.
+
+Implementations may use literal prefilters, a lazy DFA, or equivalent
+non-backtracking NFA matching. A bounded backtracker may be evaluated if
+it visits each input/state pair at most once. Unbounded backtracking is
+prohibited.
+
+#### Fallback and failures
+
+If an accelerator cannot be built, or repeatedly fills and clears its
+cache, the implementation may use an equivalent fallback. A pattern must
+not be rejected solely because its accelerator is too large when a
+fallback fits the applicable limits.
+
+Every search must return the correct match/no-match result or report an
+error that fails the affected source. Resource exhaustion and engine
+errors must never be treated as "no match."
+
+Switching engines must not change the original pattern, framing-profile
+digest, source boundaries, or decoding behavior.
+
+#### Memory budgeting
+
+The receiver must account for memory before activating a source. These
+are integration requirements; a matcher memory estimate alone does not
+reserve memory.
+
+1. **Compilation:** Before construction, reserve a conservative amount of
+   memory for temporary compilation allocations and limit how many patterns
+   can compile at once. Compilation during configuration is still subject
+   to the memory budget.
+
+2. **Compiled patterns:** Before activation, check the total retained program
+   payload against its limit. Count shared storage, allocated capacity, and
+   bookkeeping once. Limiting each individual NFA does not establish a limit
+   for the complete matcher.
+
+3. **Worker memory:** Reserve working memory for each worker and active
+   pattern. Include all lazy caches and memory that may be allocated when
+   fallback first runs. Workers own their caches; do not create a cache
+   for every pending file. Check arithmetic for overflow when calculating
+   totals. Never silently enlarge a cache to make an accelerator fit.
+
+4. **Verification:** Use engine memory reports to check the accounting
+   model. These reports may omit spare capacity or memory allocated later,
+   so they are not a complete measure of allocated memory. Exceeding the
+   reservation is an accounting failure, never a "no match" result.
+
+#### Matching time and worker responsiveness
+
+The initial limits must be qualified through testing. They do not
+guarantee a maximum matching time.
+
+Matching can require work proportional to program size multiplied by
+line length. A synchronous search cannot pause just because the worker
+has exhausted its turn budget.
+
+Oversized lines are not matched. However, a line within the size limit
+can still take long enough to delay other work on the worker.
+
+Before production qualification:
+
+- Define a numeric maximum acceptable delay to pending control work and record
+  the Linux hardware used for measurement.
+- Test maximum-sized lines that do not match, with both cold and warm
+  caches.
+- Exercise actual fallback paths and test with and without prefilters.
+- Measure peak allocations, throughput, and control-work delay in the
+  integrated receiver.
+
+If the latency target is missed, explicitly revise the bounds or supported
+workload, or implement matching that can pause and resume. Changing engines
+alone does not establish that the target is met.
+
+Any resumable implementation must preserve matching state across chunks,
+including anchors and word boundaries.
 
 ### Physical-line and logical-record bounds
 
@@ -1932,10 +2043,20 @@ When a physical line crosses `max_line_bytes`:
 
 No unbounded physical-line buffer is created.
 
-When adding a complete physical line would make a multiline body exceed
-`max_record_bytes`, the deterministic logical boundary is the LF of that first
-overflow-triggering line. Regex and line-count decisions are suppressed until that
-line ends. The framer then resets multiline state.
+In start-pattern mode, match a physical line within `max_line_bytes` before
+checking whether appending it would exceed the buffered record's byte limit.
+A matching line first completes the previous record immediately before that line,
+then begins a new record. The previous record ends cleanly at its own LF and
+requires no continuation state. A matching line that exceeds `max_record_bytes`
+on its own is split or truncated as its own record, with its own start and end.
+Oversized physical lines remain isolated and are never matched.
+
+For a line that belongs to the current record (including a new record's first
+line), if adding it would exceed `max_record_bytes`, the deterministic logical
+boundary is the LF of that overflow-triggering line. End-pattern and line-count
+decisions are suppressed for that line, and no further pattern decisions occur
+during its split/truncate replay. The framer then resets multiline state.
+An authorized partial-line completion uses its source end in place of the LF.
 
 For a body exactly equal to `max_record_bytes`, retaining another internal separator
 would overflow. The current body is emitted as a clean forced boundary before any later
@@ -2014,6 +2135,18 @@ that end. For the zero-ended scan-to-LF form, source framing establishes the
 boundary at runtime; a nonzero-delta update preserves the same start and mode
 until that proof exists, and any later continuation starts at or after the
 prior committed frontier. Zero-delta updates remain bit-for-bit preserving.
+
+Continuation stores no completion reason. For a recovered known-end sequence,
+the stored boundary makes the final fragment eligible; the original idle or
+permanent-EOF reason is not reconstructed. Do not infer
+`terminal_unterminated` from a stored end alone. This follows the
+[record-reproduction contract](#crash-recovery-and-record-reproduction):
+stored continuation coordinates remain authoritative, but completion metadata
+can change
+across a crash. In-process retries still preserve the retained batch unchanged.
+A scan-to-LF continuation that reaches LF retains its oversized-line reason;
+new idle or permanent-EOF authority is reported only when it actually completes
+that recovered pending frame.
 
 The committed prefix is neither reread nor re-emitted. For a nonzero stored end,
 a current source size below `record_end_offset` is detected truncation and
@@ -2555,6 +2688,14 @@ inspection/backup/reset procedure; it is never softened into automatic prefix
 recovery. Operators requiring the strongest available checkpoint crash
 durability keep the default `sync_interval: 0s`.
 
+A failed required synchronization is terminal, with either interval. Preserve
+retained work and fail the receiver; never release a batch based on a later
+successful fsync alone. This includes periodic/drain sync and recovery,
+publication, repair, or cleanup barriers. The
+[format failure contract](filelog-checkpoint-format.md#wal-append-failure-and-repair)
+defines the storage-remediation boundary and the limits of recovery after an
+earlier process's writeback error.
+
 ### Delivery retry
 
 Phase 1 treats every aggregate downstream Nack uniformly. The current topic
@@ -2915,9 +3056,12 @@ revalidation, the worker stages one complete table with the entire nonempty
 vetted removal set omitted, while the current live table and generation remain
 unchanged. It writes and publishes the filtered snapshot and fresh WAL through
 the ordinary compaction state machine. The filtered table becomes live only
-after the replacement `CURRENT` is durably published. Failure before that
-point leaves the prior table and generation authoritative; recovery after
-publication observes the complete filtered set. The vetted set is therefore
+after the replacement `checkpoint.db` is durably published. Failure before
+replacement leaves the prior table and generation authoritative. An ambiguous
+replacement failure blocks the store until recovery establishes which
+complete file is authoritative; it never assumes rollback. A failed required
+sync instead poisons the store under the terminal sync-failure policy. Recovery of the
+new file observes the complete filtered set. The vetted set is therefore
 atomic regardless of its size and is never divided into `remove_file`
 transactions or partially durable chunks. An empty set does not compact.
 
@@ -2934,18 +3078,17 @@ explicit retention tradeoff.
 
 Namespace creation follows the
 [checkpoint-format first-generation state machine](filelog-checkpoint-format.md#first-generation-namespace-publication).
-A namespace is new only when its directory and artifacts are absent. Existing
-artifacts without valid `CURRENT` are recovered only as the exact recognized
-interrupted-first-publication state; every other authority gap fails closed.
-No source is registered or read before snapshot, WAL, and `CURRENT` publication
-and required syncs complete. Required syncs include durable creation of every
-new namespace path component in its immediate parent as defined by the format
-state machine; syncing only the new child directory is insufficient.
+A namespace is new only when its directory and artifacts are absent. Missing
+`checkpoint.db` is recoverable only as the exact recognized interrupted initial
+publication state; every other authority gap fails closed. No source is
+registered or read before file publication, namespace directory sync, and all
+required ancestor syncs complete.
 
-For compaction accounting, `wal_bytes` is the complete current WAL file length,
-including its 56-byte header, and `wal_transactions` is the number of complete
-transactions following that header. Configuration guarantees that a fresh WAL
-plus any one valid transaction fits `checkpoint.compact_after_bytes`.
+For compaction accounting, `wal_bytes = file_length - wal_offset`, using checked
+arithmetic, and `wal_transactions` counts complete transactions in that section.
+The container header and complete snapshot prefix are excluded. A fresh file
+has zero WAL bytes, so configuration requires at least `WAL_MAX_TX_FRAME_BYTES`
+in `checkpoint.compact_after_bytes`.
 
 Before every append, the worker computes with checked arithmetic:
 
@@ -2964,23 +3107,39 @@ conservative upper bounds are:
 maximum_wal_bytes =
   min(
     checkpoint.compact_after_bytes,
-    WAL_HEADER_BYTES
-      + checkpoint.compact_after_transactions * WAL_MAX_TX_FRAME_BYTES
+    checkpoint.compact_after_transactions * WAL_MAX_TX_FRAME_BYTES
   )
 
 maximum_wal_transactions =
   min(
     checkpoint.compact_after_transactions,
     floor(
-      (checkpoint.compact_after_bytes - WAL_HEADER_BYTES)
+      checkpoint.compact_after_bytes
         / TX_MIN_FRAME_BYTES
     )
   )
 ```
 
-These are allocation and recovery bounds, not claims that every byte/count
-combination is reachable. An append that cannot satisfy the preconditions is
-refused before live state advances.
+Evaluate the capped transaction-byte product without wrapping. Saturating
+multiplication followed by the minimum preserves this bound: when the product
+exceeds `u64::MAX`, the representable byte threshold is necessarily smaller.
+That intermediate overflow alone does not reject configuration. Subsequent
+file-size and recovery-memory sums, and prospective append increments, still
+use checked arithmetic and must satisfy their respective limits.
+
+These bound newly written WALs under the selected configuration; they are not
+claims that every byte/count combination is reachable. An append that cannot
+satisfy the preconditions is refused before live state advances.
+
+Lowering either compaction threshold must not make an otherwise valid existing
+namespace unreadable. Startup streams the complete existing WAL under the
+fixed 1 GiB complete-file ceiling and the configured snapshot, record, and
+per-transaction bounds, even if its WAL exceeds the new append thresholds.
+Checksums, sequence ordering, and transition validation remain mandatory.
+Before the next append, an over-threshold store requires compaction of the
+recovered state. No new source progress is applied until that compaction and
+append succeed. Recovery never allocates the whole older WAL; aggregate
+memory admission still includes bounded replay state and transaction staging.
 
 For an Ack-authorized transaction that requires pre-append compaction, the
 retained batch remains owned and unresolved while compaction publishes the new
@@ -2992,109 +3151,102 @@ on a threshold need not trigger immediate second compaction; compaction occurs
 before the next append or at the independently scheduled retention deadline.
 
 Compaction proposes `new_generation = current_generation + 1` with checked
-arithmetic; overflow fails before writing. A generation becomes assigned only
-when a durable `CURRENT` publishes it. A successfully published generation is
-never reused. For proposed generation G, compaction uses only
-`offsets-G.snapshot.compact.tmp`, `offsets-G.wal.compact.tmp`, and
-`CURRENT.compact.tmp` as temporary names. It writes, validates, syncs, and
-closes the complete new snapshot and fresh WAL before renaming the two
-generation files to their final names with exclusive/no-replace semantics and
-syncing the directory. It then writes and syncs a complete replacement
-`CURRENT`, atomically replaces the marker, and performs the platform-required
-directory sync. The previously
-authoritative generation remains complete and recoverable until publication of
-`CURRENT` is durable.
+arithmetic; overflow fails before writing. The generation is stored inside the
+snapshot for diagnostics and monotonic publication, not encoded in filenames.
+The worker holds the separate namespace ownership lock throughout compaction
+and pauses all WAL appends and mutations while preparing and publishing the
+replacement. Source work remains subject to the existing retained-batch rules.
 
-After a crash, a valid `CURRENT` therefore names either the complete old or
-complete new generation. Complete or partial generation artifacts not named by
-`CURRENT` are abandoned and never authoritative. Before another compaction,
-cleanup recognizes only the exact temporary and final artifacts for the one
-proposed `current_generation + 1`: its snapshot/WAL final names,
-`offsets-G.snapshot.compact.tmp`, `offsets-G.wal.compact.tmp`, and the
-generation-independent `CURRENT.compact.tmp`. Cleanup rereads and validates
-`CURRENT` under exclusive ownership and requires its selection to have been
-made durable by publication sync or the [recovery barrier](#recovery-and-publication-barrier)
-before removing abandoned artifacts. It then syncs the directory. The
-unpublished number may then be proposed again. Cleanup never deletes the
-generation named by `CURRENT`, is idempotent after interruption, and completes before exclusive creation for the next attempt. Ambiguous
-authority or an invalid `CURRENT` fails closed rather than selecting by
-generation number or modification time.
+1. Finish required recovery and temporary cleanup before starting. Exclusively
+   create `checkpoint.db.compact.tmp` in the same opened namespace directory,
+   with no symlink following and least-privilege permissions.
+2. Write a complete container header and snapshot of the current table,
+   including any vetted retention removals, followed by an empty WAL section.
+   Validate the complete immutable prefix and configured bounds, sync the file,
+   and close it. Do not change the live table or release retained work yet.
+3. Close the old data-file handle while retaining `ownership.lock`. Atomically
+   replace `checkpoint.db` with the temporary file using the qualified platform
+   replacement operation. Never truncate or overwrite the active file in place.
+4. Sync the namespace directory. Only after successful durable publication may
+   the filtered table become live. Open/validate the new `checkpoint.db` for
+   appending, with the new `wal_offset`, zero WAL bytes/transactions, and next
+   transaction sequence one. Never reuse a handle to the replaced inode.
+5. Resume checkpoint work only after all these steps succeed. A failed sync
+   poisons the store and requires storage remediation. Other recoverable
+   failures after replacement may have changed authority: mark the live store
+   unavailable and reopen through recovery before retrying mutation or
+   publication. Do not append to the old file, assume rollback, or report
+   successful compaction.
 
-Recognized generations and temporary artifacts are bounded. After `CURRENT`
-durably publishes generation G with `G > 0`, the immediately prior generation
-G-1 is retired. Because another compaction cannot begin while retired cleanup is
-pending, restart recognizes exactly four states for that retired pair: both
-snapshot and WAL remain, snapshot only remains, WAL only remains, or neither
-remains. All four are valid cleanup states and none is authoritative.
+Before replacement, `checkpoint.db` remains authoritative. The replacement
+contains all current logical state, so once its publication is durable the old
+file is no longer needed. On qualified filesystems a crash during replacement
+recovers the complete old or new file. There is no independently published WAL
+and no retired generation pair to unlink. A successful publication never
+reuses a generation; an unpublished attempted number can be retried only after
+recovery establishes the active generation and cleans the temporary.
 
-Each cleanup attempt rereads and validates `CURRENT` under exclusive namespace
-ownership. Only after publication sync or the recovery barrier has made that
-selection durable, and if it still names G, cleanup removes the retired WAL and
-then the retired snapshot, treating either already-absent file as idempotent
-success, and syncs the namespace directory after the deletion set. A crash or sync
-failure leaves one of the same recognized states and cleanup resumes from the
-remaining subset. Cleanup never deletes either file belonging to the generation
-currently named by `CURRENT`.
-
-Appends to the authoritative G WAL may continue while retired cleanup is
-pending only after authority is durable through publication sync or the recovery
-barrier, and while its configured artifact bounds do not require another
-compaction. A later compaction remains blocked until retired cleanup and its
-directory sync succeed; inability to finish before the next required
-compaction enters the checkpoint-store failure/backpressure path rather than
-exceeding the WAL bound.
+Disk admission covers the old complete file plus the replacement header and
+snapshot while compaction is in progress. Recovery recognizes only the fixed
+creation and compaction temporary names. Under exclusive ownership, after
+validating `checkpoint.db`, replay, and the recovery barrier, remove a recognized
+leftover temporary, treat already-absent as success, and sync the directory.
+Never delete `checkpoint.db` or `ownership.lock`. Unexpected artifacts fail
+closed for inspection. A cleanup failure blocks another publication and uses
+bounded store retries when recoverable. A cleanup-sync failure poisons the
+store; another fsync or reopen is not a repair. This protocol admits no normal
+accumulation of retired files.
 
 #### Recovery and publication barrier
 
 Recovery holds exclusive namespace ownership throughout validation and the
-barrier below. A marker rename can remain visible after process exit without
-having survived the required directory sync. Reading a valid `CURRENT` therefore
-selects recovery input but does not by itself establish durable publication.
-Checkpoint structural or replay validation failures abort recovery immediately:
-corruption, invalid length, checksum failure, unsupported artifact/envelope
-version or operation, sequence error, impossible transition, and non-tail damage
-remain fail closed. The barrier never repairs or authorizes invalid authority.
+barrier. An atomic replacement can remain visible after process exit without
+its directory update being durable. Reading a complete `checkpoint.db` does not
+by itself establish durable publication. Recovery never selects a temporary
+file or an older generation to bypass a missing or corrupt authoritative file.
 
-Recovery proceeds as follows:
+1. Open `checkpoint.db` through the validated namespace handle. Handle absence
+   only through the exact first-publication rules; unreadable or incomplete
+   authority fails closed.
+2. Read its fixed 24-byte container header. Validate magic, version, flags, CRC,
+   minimum `wal_offset`, checked arithmetic, and configured snapshot byte bound
+   before reading or allocating the snapshot section.
+3. Derive the expected namespace digest from the exact selected `checkpoint.id`.
+   Read exactly `[24, wal_offset)`. Validate snapshot header, namespace digest,
+   record-count and physical bounds, records, footer, and exact section end.
+   The generation counter comes from this validated snapshot.
+4. Replay complete WAL transactions incrementally from `wal_offset`, starting
+   at sequence one. Validate all checksums, operation and sequence rules, and
+   apply each transaction atomically to recovery state that is not yet live.
+5. Classify only the mechanically incomplete final transaction at proven
+   physical EOF as a discardable torn suffix. Corruption, impossible state,
+   invalid section boundaries, and non-tail damage fail closed.
+6. Sync the opened checkpoint namespace directory before relying on the visible
+   file replacement. Until this recovery publication barrier succeeds, source
+   reads, progress acceptance, tail repair, temporary deletion, and another
+   publication remain blocked. File sync and engine-root sync do not replace it.
+7. If necessary, truncate the allowed torn suffix to the absolute file offset
+   `wal_offset + valid_wal_bytes`, using checked arithmetic, then sync the file
+   before appending. Never truncate below `wal_offset` or modify the header or
+   snapshot prefix. Finish recognized temporary cleanup and its directory sync.
+8. Install recovered state and resume appends only through the validated active
+   file handle, with the exact next sequence and WAL byte/transaction counts.
 
-1. Reads and validates `CURRENT` and selects exactly the named authoritative
-   generation.
-2. Derives the expected namespace digest from the exact selected
-   `checkpoint.id` bytes using the checkpoint-format recipe.
-3. Opens both named generation files. A missing, unreadable, or incomplete
-   authoritative snapshot or WAL fails closed with its distinct recovery error;
-   recovery never chooses another generation by modification time.
-4. Validates header version, bounds, integrity, generation, and namespace digest
-   before parsing a snapshot record or WAL transaction.
-5. Requires snapshot and WAL namespace digests to equal both the expected digest
-   and one another. Any mismatch is a distinct namespace-mismatch error.
-6. Loads a bounded snapshot.
-7. Replays complete transactions in strict sequence.
-8. Applies each transaction atomically to recovery state, which is not yet
-   available for new source work or checkpoint mutation.
-9. Classifies only the exact structurally incomplete final transaction defined
-   by the checkpoint-format specification as a discardable torn suffix.
-10. After validating `CURRENT` and its selected generation, synchronizes the
-    opened checkpoint namespace directory before relying on that selection.
-    This required recovery publication barrier makes the visible authority
-    selection durable, including a rename left unsynced by a previous process.
-11. Truncates and syncs an allowed torn suffix to the last valid transaction
-    boundary before permitting a new append.
-
-Until the barrier and remaining recovery steps succeed, source reads, new WAL
-appends/progress acceptance, abandoned or retired artifact deletion, and another
-publication remain blocked. Barrier failure enters the existing checkpoint-store
-failure path; bounded retries keep those operations blocked, and exhaustion
-fails the receiver. It never selects an older generation or treats visibility
-as successful sync. Reopening for recovery repeats the barrier under exclusive
-ownership. Read-only validation/inspection does not authorize mutation.
-
-The barrier is independent of `checkpoint.sync_interval` and applies to recovery
-of both first publication and later compaction. It synchronizes the namespace
-containing `CURRENT`, not merely the engine root or the WAL file. It does not
-replace generation-file sync before publication, torn-tail repair sync, or
-post-deletion directory sync. A platform cannot enable this durability contract
-without implementing and qualifying the required directory barrier.
+A failed synchronization barrier poisons the store and fails the receiver;
+no protected work or sync-only retry is admitted afterward. Reopening is not
+an escape from a known sync failure. The checkpoint store enforces this only
+within an instance; it has no durable or process-wide poison history.
+The receiver and lifecycle supervisor must preserve the terminal condition
+outside that instance and block automatic reopen, including after startup
+errors, reconfiguration, and supervisor-driven restart. This remains a
+required integration gate.
+Ordinary recovery after process interruption repeats validation and the barrier, but cannot prove that an
+earlier process never observed a writeback error during the same boot. The
+[terminal sync-failure contract](filelog-checkpoint-format.md#wal-append-failure-and-repair)
+applies to first publication and compaction independently of
+`checkpoint.sync_interval`. Read-only inspection does not grant mutation authority. File sync before replacement, tail-repair sync, and cleanup
+sync are additional requirements. Platform crash qualification must cover the
+replacement protocol and repeated process exits before its directory barrier.
 
 Live WAL append failure distinguishes no-write, known-partial, ambiguous-write,
 and append-success/sync-failure outcomes using the
@@ -3110,7 +3262,7 @@ Fail-closed namespace recovery does not authorize automatic salvage. Production
 qualification requires a supported exclusive procedure that can inspect and
 validate bounded artifacts, preserve an evidence backup, and deliberately
 reset the complete namespace with explicit replay or `start_at` consequences.
-Repointing `CURRENT` to an older generation is not a Phase 1 recovery operation;
+Restoring an older checkpoint file is not a Phase 1 recovery operation;
 it requires separate review because it can roll progress back and duplicate
 previously delivered data.
 
@@ -3574,7 +3726,8 @@ evidence, not merely an OS error number:
 | Aggregate downstream Nack | Receiver-wide batch | Retain and retry uniformly within delivery bounds |
 | Retry exhaustion | Receiver-wide delivery | Apply `on_retry_exhaustion`; default observable pause with periodic retries and no new source reads |
 | Invalid startup topology/configuration | Receiver | Fail before source admission; downstream permanent-refusal handling is deferred until typed Nack metadata survives end to end |
-| Checkpoint append/sync/compaction failure, including checkpoint-side `ENOSPC` | Receiver | Bounded consecutive store failures, then terminal; never per-file quarantine |
+| Recoverable checkpoint append/compaction I/O failure, including checkpoint-side `ENOSPC` without a failed sync | Receiver | Bounded consecutive store failures, then terminal; never per-file quarantine |
+| Failed required checkpoint file or directory sync | Receiver | Poison the store and fail immediately; no sync-only retry or automatic reopen; require explicit storage incident recovery |
 | Structurally complete checkpoint CRC failure, namespace mismatch, impossible transition, or other checkpoint/namespace corruption | Receiver startup or receiver | Fail closed; never quarantine one file and never recover an automatic WAL prefix |
 | Namespace lock timeout | Receiver startup | Terminal without reading |
 | Lease-registry integrity failure | Receiver | Fail closed |

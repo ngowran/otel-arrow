@@ -1,5 +1,11 @@
 [
   {
+    "id": "urn:microsoft:exporter:azure_data_explorer",
+    "category": "Exporter",
+    "description": null,
+    "attributes": {}
+  },
+  {
     "id": "urn:microsoft:exporter:azure_monitor",
     "category": "Exporter",
     "description": null,
@@ -108,6 +114,24 @@
     "attributes": {}
   },
   {
+    "id": "urn:otel:extension:flat_file_api_key_auth",
+    "category": "Extension",
+    "description": null,
+    "attributes": {}
+  },
+  {
+    "id": "urn:otel:extension:flat_file_sasl_auth",
+    "category": "Extension",
+    "description": null,
+    "attributes": {}
+  },
+  {
+    "id": "urn:otel:extension:flat_file_user_pass_auth",
+    "category": "Extension",
+    "description": null,
+    "attributes": {}
+  },
+  {
     "id": "urn:otel:extension:oauth2_client_auth",
     "category": "Extension",
     "description": null,
@@ -115,6 +139,12 @@
   },
   {
     "id": "urn:otel:extension:k8s_service_account_token_auth",
+    "category": "Extension",
+    "description": null,
+    "attributes": {}
+  },
+  {
+    "id": "urn:otel:extension:oauth2_client_auth",
     "category": "Extension",
     "description": null,
     "attributes": {}
@@ -258,6 +288,12 @@
     "attributes": {}
   },
   {
+    "id": "urn:otel:receiver:oracle",
+    "category": "Receiver",
+    "description": null,
+    "attributes": {}
+  },
+  {
     "id": "urn:otel:receiver:otap",
     "category": "Receiver",
     "description": null,
@@ -265,6 +301,12 @@
   },
   {
     "id": "urn:otel:receiver:otlp",
+    "category": "Receiver",
+    "description": null,
+    "attributes": {}
+  },
+  {
+    "id": "urn:otel:receiver:postgresql",
     "category": "Receiver",
     "description": null,
     "attributes": {}

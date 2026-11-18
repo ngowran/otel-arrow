@@ -12,6 +12,7 @@ use super::super::encoder::MetricExemplar;
 use super::super::encoder::exemplar::{
     MAX_EXEMPLAR_PAYLOAD_SIZE, encoded_exemplar_size_from_parts,
 };
+use super::{MappingError, memory::MappingMemory};
 
 const MAX_EXEMPLAR_AGE_NANOS: u64 = 60_000_000_000;
 const MAX_SAMPLING_BUCKET_COUNT: usize = 12;
@@ -27,7 +28,8 @@ struct ExemplarCandidate<E> {
 pub(super) fn map_exemplars<I, E>(
     exemplars: I,
     data_point_time: u64,
-) -> Result<Vec<MetricExemplar>, Utf8Error>
+    memory: &MappingMemory,
+) -> Result<Vec<MetricExemplar>, MappingError>
 where
     I: IntoIterator<Item = E>,
     E: ExemplarView,
@@ -42,13 +44,15 @@ where
             continue;
         }
         if let Some(candidate) = exemplar_candidate(exemplar)? {
+            memory.charge_items::<ExemplarCandidate<E>>(1)?;
             candidates.push(candidate);
         }
     }
     retain_candidates_within_limits(&mut candidates);
+    memory.charge_items::<MetricExemplar>(candidates.len())?;
     candidates
         .into_iter()
-        .map(|candidate| map_exemplar(&candidate.source))
+        .map(|candidate| map_exemplar(&candidate.source, memory))
         .collect()
 }
 
@@ -94,16 +98,21 @@ where
     Ok(())
 }
 
-fn map_exemplar<E>(exemplar: &E) -> Result<MetricExemplar, Utf8Error>
+fn map_exemplar<E>(exemplar: &E, memory: &MappingMemory) -> Result<MetricExemplar, MappingError>
 where
     E: ExemplarView,
 {
     let mut filtered_attributes = Vec::new();
     for attribute in exemplar.filtered_attributes() {
+        memory.charge_items::<(String, String)>(1)?;
+        memory.charge(attribute.key().len())?;
         let name = str::from_utf8(attribute.key())?.to_string();
         let value = match attribute.value() {
             Some(value) => match value.as_string() {
-                Some(value) => str::from_utf8(value)?.to_string(),
+                Some(value) => {
+                    memory.charge(value.len())?;
+                    str::from_utf8(value)?.to_string()
+                }
                 None => String::new(),
             },
             None => String::new(),
@@ -261,7 +270,8 @@ fn retain_distribution_sample<E>(
                     mixed_negative_exemplar_bucket(value, extrema.negative, bucket_count),
                 )
             } else {
-                SamplingDecision::Reprocess
+                // NaN: no comparison above matches, so discard rather than stall the loop.
+                SamplingDecision::Discard
             }
         } else {
             let buckets = if extrema.positive.is_some() {
@@ -279,7 +289,6 @@ fn retain_distribution_sample<E>(
                 active_len -= 1;
                 candidates.swap(current, active_len);
             }
-            SamplingDecision::Reprocess => {}
         }
         if !is_zero && payload_size <= MAX_EXEMPLAR_PAYLOAD_SIZE {
             break;
@@ -292,7 +301,6 @@ fn retain_distribution_sample<E>(
 enum SamplingDecision {
     Keep,
     Discard,
-    Reprocess,
 }
 
 fn bucket_decision(
@@ -308,6 +316,12 @@ fn bucket_decision(
     }
 }
 
+// Returns the bucket index for a value in a logarithmically spaced range.
+fn logarithmic_bucket_index(value: f64, minimum: f64, maximum: f64, bucket_count: usize) -> f64 {
+    let growth = (maximum / minimum).powf(1.0 / bucket_count as f64);
+    ((value / minimum).ln() / growth.ln()).floor()
+}
+
 fn exemplar_bucket(value: f64, range: Option<(f64, f64)>, bucket_count: usize) -> Option<usize> {
     let (minimum, maximum) = range?;
     if value == maximum {
@@ -316,12 +330,11 @@ fn exemplar_bucket(value: f64, range: Option<(f64, f64)>, bucket_count: usize) -
     if minimum == maximum {
         return Some(0);
     }
-    let growth = (maximum / minimum).powf(1.0 / bucket_count as f64);
-    let raw_index = (value / minimum).ln() / growth.ln();
+    let raw_index = logarithmic_bucket_index(value, minimum, maximum, bucket_count);
     if !raw_index.is_finite() {
         return None;
     }
-    let index = raw_index.floor() as isize;
+    let index = raw_index as isize;
     if index < 0 || index > bucket_count as isize {
         return None;
     }
@@ -341,8 +354,7 @@ fn mixed_negative_exemplar_bucket(
     let raw_index = if value == minimum {
         bucket_count as f64
     } else {
-        let growth = (maximum / minimum).powf(1.0 / bucket_count as f64);
-        ((value / minimum).ln() / growth.ln()).floor()
+        logarithmic_bucket_index(value, minimum, maximum, bucket_count)
     };
     if !raw_index.is_finite() {
         return None;
@@ -380,7 +392,7 @@ mod tests {
     }
 
     fn map_exemplar(exemplar: &OtlpExemplar) -> MetricExemplar {
-        super::map_exemplar(&ObjExemplar::new(exemplar))
+        super::map_exemplar(&ObjExemplar::new(exemplar), &MappingMemory::default())
             .expect("test exemplar should contain valid UTF-8")
     }
 
@@ -525,6 +537,41 @@ mod tests {
         assert!(candidate_payload_size(&candidates) <= MAX_EXEMPLAR_PAYLOAD_SIZE);
     }
 
+    /// Scenario: A mixed-sign exemplar set includes a NaN value, which cannot be bucketed into
+    /// either the positive or negative distribution.
+    /// Guarantees: The NaN candidate is discarded outright rather than stalling the sampling
+    /// cursor, so later candidates are still evaluated and the payload is trimmed to the limit.
+    #[test]
+    fn discards_nan_values_in_mixed_sign_distributions() {
+        // NaN is placed first so it is guaranteed to be evaluated before any early-exit check
+        // can short-circuit the sampling loop once the payload already fits under the limit.
+        let values = [
+            f64::NAN,
+            -16.0,
+            -1.0,
+            -1.0,
+            2.0,
+            4.0,
+            8.0,
+            16.0,
+            32.0,
+            64.0,
+            128.0,
+            1.0,
+        ];
+        let mut candidates = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| sampling_candidate(value, index))
+            .collect::<Vec<_>>();
+        assert!(candidate_payload_size(&candidates) > MAX_EXEMPLAR_PAYLOAD_SIZE);
+
+        retain_candidates_within_limits(&mut candidates);
+
+        assert!(candidates.iter().all(|candidate| !candidate.value.is_nan()));
+        assert!(candidate_payload_size(&candidates) <= MAX_EXEMPLAR_PAYLOAD_SIZE);
+    }
+
     /// Scenario: Borrowed OTLP exemplar sizing covers string and non-string labels plus optional identifier fields.
     /// Guarantees: Candidate preflight matches the encoder size and rejects oversized exemplars before label cloning.
     #[test]
@@ -586,6 +633,7 @@ mod tests {
         let mapped = map_exemplars(
             ExemplarIter::new([stale, oversized, valid].iter()),
             data_point_time,
+            &MappingMemory::default(),
         )
         .expect("test exemplars should contain valid UTF-8");
 

@@ -1,21 +1,12 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use super::otlp_to_geneva::{ScopeAttributes, default_max_mapping_bytes};
 use serde::Deserialize;
 use std::time::Duration;
 
 fn default_timeout() -> Duration {
     Duration::from_secs(30)
-}
-
-/// Scope attribute selection for one instrumentation scope name.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ScopeAttributes {
-    /// Instrumentation scope name, or `*` for all scopes.
-    pub name: String,
-    /// Attribute keys to include, or `*` for all attributes.
-    pub keys: Vec<String>,
 }
 
 /// Authentication applied to Geneva metrics publication requests.
@@ -24,7 +15,6 @@ pub struct ScopeAttributes {
 pub enum AuthConfig {
     /// Use a bound `bearer_token_provider` capability.
     Bearer,
-
     /// Exchange a bound managed identity token for an account-specific GIG token.
     ManagedIdentity,
 }
@@ -33,6 +23,10 @@ pub enum AuthConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Conservative per-input mapping allocation budget in bytes (default: 128 MiB).
+    #[serde(default = "default_max_mapping_bytes")]
+    pub max_mapping_bytes: usize,
+
     /// Full publication endpoint for bearer auth, or home stamp origin for managed identity auth.
     pub endpoint: String,
 
@@ -42,7 +36,7 @@ pub struct Config {
     /// Default metric namespace when OTLP attributes do not override it.
     pub metric_namespace: String,
 
-    /// Maximum time allowed for one HTTP publication request.
+    /// Maximum time allowed to publish all packets of one input.
     #[serde(default = "default_timeout", with = "humantime_serde")]
     pub timeout: Duration,
 
@@ -79,20 +73,11 @@ impl Config {
         }
         let endpoint = reqwest::Url::parse(endpoint)
             .map_err(|error| format!("endpoint must be a valid URL: {error}"))?;
-        if !matches!(endpoint.scheme(), "http" | "https") {
-            return Err("endpoint must use HTTP or HTTPS".to_string());
-        }
-        if self.monitoring_account.trim().is_empty() {
-            return Err("monitoring_account must not be empty".to_string());
-        }
-        if self.metric_namespace.trim().is_empty() {
-            return Err("metric_namespace must not be empty".to_string());
+        if endpoint.scheme() != "https" {
+            return Err("bearer authentication requires an HTTPS endpoint".to_string());
         }
         if self.timeout.is_zero() {
             return Err("timeout must be greater than zero".to_string());
-        }
-        if endpoint.scheme() != "https" {
-            return Err("bearer authentication requires an HTTPS endpoint".to_string());
         }
         if self.auth == AuthConfig::ManagedIdentity
             && (endpoint.path() != "/"
@@ -104,32 +89,19 @@ impl Config {
                     .to_string(),
             );
         }
-        if self
-            .scope_attributes
-            .iter()
-            .any(|selection| selection.name.trim().is_empty() || selection.keys.is_empty())
-        {
-            return Err("scope_attributes entries require a name and at least one key".to_string());
-        }
-        Ok(())
+        super::otlp_to_geneva::Config::from(self).validate()
     }
 }
 
 impl From<&Config> for super::otlp_to_geneva::Config {
     fn from(config: &Config) -> Self {
         Self {
+            max_mapping_bytes: config.max_mapping_bytes,
             monitoring_account: config.monitoring_account.clone(),
             metric_namespace: config.metric_namespace.clone(),
             resource_attributes: config.resource_attributes.clone(),
             honor_resource_attributes: config.honor_resource_attributes,
-            scope_attributes: config
-                .scope_attributes
-                .iter()
-                .map(|selection| super::otlp_to_geneva::ScopeAttributes {
-                    name: selection.name.clone(),
-                    keys: selection.keys.clone(),
-                })
-                .collect(),
+            scope_attributes: config.scope_attributes.clone(),
             honor_scope_attributes: config.honor_scope_attributes,
             disable_exemplars: config.disable_exemplars,
         }
@@ -152,126 +124,83 @@ mod tests {
             scope_attributes: Vec::new(),
             honor_scope_attributes: false,
             disable_exemplars: false,
+            max_mapping_bytes: default_max_mapping_bytes(),
         }
     }
 
-    /// Scenario: A configuration supplies an endpoint and monitoring account.
-    /// Guarantees: The minimal exporter configuration is accepted.
+    /// Scenario: Managed identity authentication targets a home stamp or a publication URL.
+    /// Guarantees: Only an HTTPS origin can be used for the account-specific GIG exchange.
     #[test]
-    fn accepts_minimal_config() {
-        let config = valid_config();
-
-        assert_eq!(config.validate(), Ok(()));
-    }
-
-    /// Scenario: A configuration omits a usable endpoint.
-    /// Guarantees: Invalid endpoint configuration is rejected before startup.
-    #[test]
-    fn rejects_empty_endpoint() {
+    fn validates_managed_identity_home_stamp() {
         let mut config = valid_config();
-        config.endpoint = " ".to_string();
-
-        assert_eq!(
-            config.validate(),
-            Err("endpoint must not be empty".to_string())
-        );
-    }
-
-    /// Scenario: A configuration supplies a malformed or unsupported endpoint URL.
-    /// Guarantees: Endpoint errors are reported during component validation instead of first publication.
-    #[test]
-    fn rejects_invalid_endpoint_urls() {
-        let mut malformed = valid_config();
-        malformed.endpoint = "not a URL".to_string();
-        let malformed_error = malformed
-            .validate()
-            .expect_err("malformed endpoint should fail");
-        assert!(malformed_error.starts_with("endpoint must be a valid URL:"));
-
-        let mut unsupported_scheme = valid_config();
-        unsupported_scheme.endpoint = "ftp://example.test/metrics".to_string();
-        assert_eq!(
-            unsupported_scheme.validate(),
-            Err("endpoint must use HTTP or HTTPS".to_string())
-        );
-    }
-
-    /// Scenario: A configuration omits the fallback metric namespace.
-    /// Guarantees: OTLP metrics cannot start without a namespace used when no override attribute exists.
-    #[test]
-    fn rejects_empty_metric_namespace() {
-        let mut config = valid_config();
-        config.metric_namespace = " ".to_string();
-
-        assert_eq!(
-            config.validate(),
-            Err("metric_namespace must not be empty".to_string())
-        );
-    }
-
-    /// Scenario: Bearer authentication targets an unencrypted HTTP endpoint.
-    /// Guarantees: Credentials cannot be configured for transmission without TLS.
-    #[test]
-    fn rejects_bearer_auth_for_http_endpoint() {
-        let mut config = valid_config();
-        config.endpoint = "http://example.test/metrics".to_string();
-        config.auth = AuthConfig::Bearer;
-
-        assert_eq!(
-            config.validate(),
-            Err("bearer authentication requires an HTTPS endpoint".to_string())
-        );
-    }
-
-    /// Scenario: Managed identity authentication is configured with a Geneva home stamp origin.
-    /// Guarantees: GIG token exchange can be selected without embedding a publication route.
-    #[test]
-    fn accepts_managed_identity_home_stamp() {
-        let mut config = valid_config();
-        config.endpoint = "https://prod6.prod.microsoftmetrics.com".to_string();
         config.auth = AuthConfig::ManagedIdentity;
-
+        config.endpoint = "https://prod6.prod.microsoftmetrics.com".into();
         assert_eq!(config.validate(), Ok(()));
+        for endpoint in [
+            "https://prod6.prod.microsoftmetrics.com/metrics",
+            "https://prod6.prod.microsoftmetrics.com/?account=test",
+            "https://prod6.prod.microsoftmetrics.com/#fragment",
+        ] {
+            config.endpoint = endpoint.into();
+            assert!(
+                config
+                    .validate()
+                    .expect_err("managed identity requires an origin")
+                    .contains("home stamp origin")
+            );
+        }
     }
 
-    /// Scenario: Managed identity authentication is configured with a classic FE publication route.
-    /// Guarantees: Route mistakes are rejected before the exporter can follow an interactive redirect.
+    /// Scenario: Each field is set to an empty, malformed, non-HTTPS, zero, reserved, or incomplete value.
+    /// Guarantees: Validation rejects every invalid configuration with a field-specific error before exporter startup.
     #[test]
-    fn rejects_managed_identity_endpoint_path() {
-        let mut config = valid_config();
-        config.endpoint = "https://prod6.prod.microsoftmetrics.com/api/v1/data/metrics".to_string();
-        config.auth = AuthConfig::ManagedIdentity;
-
-        assert_eq!(
-            config.validate(),
-            Err(
-                "managed_identity endpoint must be a Geneva home stamp origin without a path, query, or fragment"
-                    .to_string()
-            )
-        );
-    }
-
-    /// Scenario: Runtime-only constraints contain a zero duration or empty scope selection.
-    /// Guarantees: Invalid runtime state is rejected before exporter startup.
-    #[test]
-    fn rejects_invalid_runtime_constraints() {
-        let mut zero_timeout = valid_config();
-        zero_timeout.timeout = Duration::ZERO;
-
-        let mut invalid_scope = valid_config();
-        invalid_scope.scope_attributes = vec![ScopeAttributes {
-            name: " ".to_string(),
-            keys: vec!["dimension".to_string()],
-        }];
-
-        for (config, expected) in [
-            (zero_timeout, "timeout must be greater than zero"),
+    fn rejects_invalid_config() {
+        let cases: [(fn(&mut Config), &str); 10] = [
             (
-                invalid_scope,
+                |c| c.max_mapping_bytes = 0,
+                "max_mapping_bytes must be greater than zero",
+            ),
+            (|c| c.endpoint = " ".into(), "endpoint must not be empty"),
+            (
+                |c| c.endpoint = "not a URL".into(),
+                "endpoint must be a valid URL:",
+            ),
+            (
+                |c| c.endpoint = "http://example.test/metrics".into(),
+                "bearer authentication requires an HTTPS endpoint",
+            ),
+            (
+                |c| c.endpoint = "ftp://example.test/metrics".into(),
+                "bearer authentication requires an HTTPS endpoint",
+            ),
+            (
+                |c| c.timeout = Duration::ZERO,
+                "timeout must be greater than zero",
+            ),
+            (
+                |c| c.metric_namespace = " ".into(),
+                "metric_namespace must not be empty",
+            ),
+            (|c| c.monitoring_account = "Default".into(), "reserved"),
+            (|c| c.monitoring_account = "*".into(), "reserved"),
+            (
+                |c| {
+                    c.scope_attributes = vec![ScopeAttributes {
+                        name: " ".to_string(),
+                        keys: vec!["dimension".to_string()],
+                    }]
+                },
                 "scope_attributes entries require a name and at least one key",
             ),
-        ] {
-            assert_eq!(config.validate(), Err(expected.to_string()));
+        ];
+        for (invalidate, expected) in cases {
+            let mut config = valid_config();
+            invalidate(&mut config);
+            let error = config.validate().expect_err(expected);
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
         }
     }
 }

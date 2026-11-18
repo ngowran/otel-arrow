@@ -9,7 +9,7 @@ use otel_arrow_dfe_config::observed_state::ObservedStateSettings;
 use otel_arrow_dfe_config::settings::telemetry::logs::LogLevel;
 use otel_arrow_dfe_engine::config::{ExporterConfig, ProcessorConfig, ReceiverConfig};
 use otel_arrow_dfe_engine::context_declaration::{
-    ConfigNodeContextDeclaration, ContextDeclaration, ContextDeclarationProvider,
+    ConfigNodeContextDeclaration, ContextDeclaration, ContextDeclarationProvider, ContextDomain,
     NodeContextDeclarations,
 };
 use otel_arrow_dfe_engine::control::{
@@ -33,7 +33,7 @@ use otel_arrow_dfe_telemetry::log_filter::{RuntimeLogFilter, RuntimeLogFilterHan
 use otel_arrow_dfe_telemetry::metrics::MetricSetSnapshot;
 use otel_arrow_dfe_telemetry::tracing_init::ProviderSetup;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio_util::sync::CancellationToken;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Registry;
@@ -108,6 +108,7 @@ struct ContextBindingsTestConfig {
 impl ConfigNodeContextDeclaration for ContextBindingsTestConfig {
     fn context_declarations(&self) -> NodeContextDeclarations {
         vec![ContextDeclaration::Produces {
+            domain: ContextDomain::TransportHeader,
             entry: self.produces.clone(),
         }]
         .into_iter()
@@ -223,6 +224,80 @@ impl receiver::Receiver<()> for RecoveryTestReceiver {
     }
 }
 
+struct StartupFailingReceiver;
+
+#[async_trait(?Send)]
+impl receiver::Receiver<()> for StartupFailingReceiver {
+    async fn start(
+        self: Box<Self>,
+        _ctrl_chan: receiver::ControlChannel<()>,
+        effect_handler: receiver::EffectHandler<()>,
+    ) -> Result<TerminalState, EngineError> {
+        Err(EngineError::ReceiverError {
+            receiver: effect_handler.receiver_id(),
+            kind: otel_arrow_dfe_engine::error::ReceiverErrorKind::Connect,
+            error: "simulated receiver bind failure".to_owned(),
+            source_detail: String::new(),
+        })
+    }
+}
+
+struct ReadyThenFailingReceiver;
+
+#[async_trait(?Send)]
+impl receiver::Receiver<()> for ReadyThenFailingReceiver {
+    async fn start(
+        self: Box<Self>,
+        _ctrl_chan: receiver::ControlChannel<()>,
+        effect_handler: receiver::EffectHandler<()>,
+    ) -> Result<TerminalState, EngineError> {
+        effect_handler.signal_ready();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Err(EngineError::ReceiverError {
+            receiver: effect_handler.receiver_id(),
+            kind: otel_arrow_dfe_engine::error::ReceiverErrorKind::Other,
+            error: "simulated failure after readiness".to_owned(),
+            source_detail: String::new(),
+        })
+    }
+}
+
+static DELAYED_READY_RECEIVER_STARTED: AtomicBool = AtomicBool::new(false);
+static DELAYED_READY_RECEIVER_RELEASED: AtomicBool = AtomicBool::new(false);
+static DELAYED_READY_RECEIVER_SIGNALLED: AtomicBool = AtomicBool::new(false);
+static DELAYED_READY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct DelayedReadyReceiver;
+
+#[async_trait(?Send)]
+impl receiver::Receiver<()> for DelayedReadyReceiver {
+    async fn start(
+        self: Box<Self>,
+        mut ctrl_chan: receiver::ControlChannel<()>,
+        effect_handler: receiver::EffectHandler<()>,
+    ) -> Result<TerminalState, EngineError> {
+        DELAYED_READY_RECEIVER_STARTED.store(true, Ordering::SeqCst);
+        while !DELAYED_READY_RECEIVER_RELEASED.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        effect_handler.signal_ready();
+        DELAYED_READY_RECEIVER_SIGNALLED.store(true, Ordering::SeqCst);
+
+        loop {
+            match ctrl_chan.recv().await? {
+                NodeControlMsg::DrainIngress { deadline, .. } => {
+                    effect_handler.notify_receiver_drained().await?;
+                    return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
+                }
+                NodeControlMsg::Shutdown { deadline, .. } => {
+                    return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 struct RecoveryTestExporter;
 
 #[async_trait(?Send)]
@@ -255,6 +330,45 @@ fn recovery_test_receiver_create(
         node_config,
         receiver_config,
     ))
+}
+
+fn startup_failing_receiver_create(
+    _pipeline_ctx: PipelineContext,
+    node: otel_arrow_dfe_engine::node::NodeId,
+    node_config: Arc<NodeUserConfig>,
+    receiver_config: &ReceiverConfig,
+    _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
+) -> Result<ReceiverWrapper<()>, otel_arrow_dfe_config::error::Error> {
+    Ok(
+        ReceiverWrapper::local(StartupFailingReceiver, node, node_config, receiver_config)
+            .with_startup_readiness(),
+    )
+}
+
+fn ready_then_failing_receiver_create(
+    _pipeline_ctx: PipelineContext,
+    node: otel_arrow_dfe_engine::node::NodeId,
+    node_config: Arc<NodeUserConfig>,
+    receiver_config: &ReceiverConfig,
+    _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
+) -> Result<ReceiverWrapper<()>, otel_arrow_dfe_config::error::Error> {
+    Ok(
+        ReceiverWrapper::local(ReadyThenFailingReceiver, node, node_config, receiver_config)
+            .with_startup_readiness(),
+    )
+}
+
+fn delayed_ready_receiver_create(
+    _pipeline_ctx: PipelineContext,
+    node: otel_arrow_dfe_engine::node::NodeId,
+    node_config: Arc<NodeUserConfig>,
+    receiver_config: &ReceiverConfig,
+    _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
+) -> Result<ReceiverWrapper<()>, otel_arrow_dfe_config::error::Error> {
+    Ok(
+        ReceiverWrapper::local(DelayedReadyReceiver, node, node_config, receiver_config)
+            .with_startup_readiness(),
+    )
 }
 
 fn recovery_test_exporter_create(
@@ -444,6 +558,78 @@ static RECOVERY_TEST_EXPORTER_FACTORIES: &[ExporterFactory<()>] = &[
 
 static RECOVERY_TEST_PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::new(
     RECOVERY_TEST_RECEIVER_FACTORIES,
+    TEST_PROCESSOR_FACTORIES,
+    RECOVERY_TEST_EXPORTER_FACTORIES,
+    &[],
+);
+
+static STARTUP_FAILING_RECEIVER_FACTORIES: &[ReceiverFactory<()>] = &[
+    ReceiverFactory {
+        name: "urn:test:receiver:example",
+        create: startup_failing_receiver_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+    ReceiverFactory {
+        name: "urn:otel:receiver:internal_telemetry",
+        create: recovery_test_receiver_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+];
+
+static STARTUP_FAILING_PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::new(
+    STARTUP_FAILING_RECEIVER_FACTORIES,
+    TEST_PROCESSOR_FACTORIES,
+    RECOVERY_TEST_EXPORTER_FACTORIES,
+    &[],
+);
+
+static READY_THEN_FAILING_RECEIVER_FACTORIES: &[ReceiverFactory<()>] = &[
+    ReceiverFactory {
+        name: "urn:test:receiver:example",
+        create: ready_then_failing_receiver_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+    ReceiverFactory {
+        name: "urn:otel:receiver:internal_telemetry",
+        create: recovery_test_receiver_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+];
+
+static READY_THEN_FAILING_PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::new(
+    READY_THEN_FAILING_RECEIVER_FACTORIES,
+    TEST_PROCESSOR_FACTORIES,
+    RECOVERY_TEST_EXPORTER_FACTORIES,
+    &[],
+);
+
+static DELAYED_READY_RECEIVER_FACTORIES: &[ReceiverFactory<()>] = &[
+    ReceiverFactory {
+        name: "urn:test:receiver:example",
+        create: delayed_ready_receiver_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+    ReceiverFactory {
+        name: "urn:otel:receiver:internal_telemetry",
+        create: recovery_test_receiver_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+];
+
+static DELAYED_READY_PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::new(
+    DELAYED_READY_RECEIVER_FACTORIES,
     TEST_PROCESSOR_FACTORIES,
     RECOVERY_TEST_EXPORTER_FACTORIES,
     &[],
@@ -735,9 +921,47 @@ fn engine_config_with_context_entries(
     OtelDataflowSpec::from_yaml(&yaml).expect("context engine config should parse")
 }
 
+fn engine_config_with_group_policy_and_pipeline() -> OtelDataflowSpec {
+    OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+groups:
+    g1:
+        policies:
+            channel_capacity:
+                control:
+                    node: 257
+        pipelines:
+            p1:
+                nodes:
+                    receiver:
+                        type: "urn:test:receiver:example"
+                        config: null
+                    exporter:
+                        type: "urn:test:exporter:example"
+                        config: null
+                connections:
+                    - { from: receiver, to: exporter }
+"#,
+    )
+    .expect("engine config with group policy should parse")
+}
+
 fn empty_engine_config() -> OtelDataflowSpec {
     OtelDataflowSpec::from_yaml("version: otel_dataflow/v1\n")
         .expect("empty engine config should parse")
+}
+
+fn empty_pipeline_group_config() -> OtelDataflowSpec {
+    OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+groups:
+  g1:
+    pipelines: {}
+"#,
+    )
+    .expect("empty pipeline group config should parse")
 }
 
 fn reconcile_request(
@@ -768,6 +992,65 @@ fn simple_pipeline_yaml() -> &'static str {
 "#
 }
 
+fn rollback_test_pipeline_yaml(core_count: usize, replacement_shape: bool) -> String {
+    let (receiver, exporter) = if replacement_shape {
+        ("input", "output")
+    } else {
+        ("receiver", "exporter")
+    };
+    format!(
+        r#"
+        policies:
+          resources:
+            core_allocation:
+              type: core_count
+              count: {core_count}
+        nodes:
+          {receiver}:
+            type: "urn:test:receiver:example"
+            config: null
+          {exporter}:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: {receiver}
+            to: {exporter}
+"#
+    )
+}
+
+fn rollback_test_pipeline_config(core_count: usize, replacement_shape: bool) -> PipelineConfig {
+    engine_config_with_pipeline(&rollback_test_pipeline_yaml(core_count, replacement_shape))
+        .groups
+        .get(&PipelineGroupId::from("g1"))
+        .and_then(|group| group.pipelines.get(&PipelineId::from("p1")))
+        .cloned()
+        .expect("rollback test pipeline should exist")
+}
+
+fn prepare_rollback_test_plan(
+    runtime: &Arc<ControllerRuntime<()>>,
+    pipeline: PipelineConfig,
+    step_timeout_secs: u64,
+    drain_timeout_secs: u64,
+) -> CandidateRolloutPlan {
+    let plan = runtime
+        .prepare_rollout_plan(
+            "g1",
+            "p1",
+            &ReconfigureRequest {
+                pipeline,
+                step_timeout_secs,
+                drain_timeout_secs,
+            },
+        )
+        .expect("rollback test rollout should be accepted");
+    runtime
+        .insert_rollout(&plan.pipeline_key, plan.rollout.clone())
+        .expect("rollback test rollout should register");
+    plan
+}
+
 fn register_existing_pipeline(runtime: &ControllerRuntime<()>, config: &OtelDataflowSpec) {
     register_pipeline(runtime, config, "g1", "p1");
 }
@@ -791,7 +1074,33 @@ fn register_pipeline(
     let placement = runtime
         .pipeline_placement_for_resolved(&resolved)
         .expect("resolved pipeline placement should exist");
-    runtime.register_committed_pipeline(resolved, placement, 0);
+    register_committed_pipeline(runtime, resolved, placement, 0);
+}
+
+fn register_committed_pipeline(
+    runtime: &ControllerRuntime<()>,
+    resolved: ResolvedPipelineConfig,
+    placement: PipelinePlacement,
+    generation: u64,
+) {
+    let context_bindings = {
+        let state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&state.latest_context_bindings)
+    };
+    let listener_group_snapshot = Arc::new(listener_group::snapshot_for_pipeline(
+        &resolved, &placement, 0,
+    ));
+    let deployment = LogicalPipelineDeployment::new(
+        resolved,
+        context_bindings,
+        generation,
+        placement,
+        listener_group_snapshot,
+    );
+    runtime.register_committed_pipeline(&deployment);
 }
 
 fn register_runtime_instance(
@@ -820,6 +1129,7 @@ fn register_runtime_instance(
         RuntimeInstanceRecord {
             control_sender: Some(control_sender),
             context_bindings,
+            startup_ready: Arc::new(AtomicBool::new(false)),
             lifecycle,
         },
     );
@@ -846,12 +1156,48 @@ fn register_runtime_instance_with_sender(
         RuntimeInstanceRecord {
             control_sender: Some(control_sender),
             context_bindings,
+            startup_ready: Arc::new(AtomicBool::new(false)),
             lifecycle,
         },
     );
     if is_active {
         state.active_instances += 1;
     }
+}
+
+struct RetryingPipelineAdminSender {
+    calls: Arc<Mutex<Vec<String>>>,
+    failures_remaining: Arc<AtomicUsize>,
+}
+
+impl PipelineAdminSender for RetryingPipelineAdminSender {
+    fn try_send_shutdown(&self, _deadline: Instant, reason: String) -> Result<(), EngineError> {
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(reason);
+        let remaining = self.failures_remaining.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.failures_remaining
+                .store(remaining - 1, Ordering::SeqCst);
+            Err(EngineError::RuntimeMsgError {
+                error: "simulated send failure".to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn retrying_admin_sender(
+    initial_failures: usize,
+) -> (Arc<dyn PipelineAdminSender>, Arc<Mutex<Vec<String>>>) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let sender = Arc::new(RetryingPipelineAdminSender {
+        calls: Arc::clone(&calls),
+        failures_remaining: Arc::new(AtomicUsize::new(initial_failures)),
+    });
+    (sender, calls)
 }
 
 struct RecordingPipelineAdminSender {
@@ -961,6 +1307,7 @@ fn launched_runtime_instance(
         },
         control_sender,
         context_bindings,
+        startup_ready: Arc::new(AtomicBool::new(false)),
         _marker: std::marker::PhantomData,
     }
 }
@@ -1014,6 +1361,93 @@ fn complete_instance_exit_on_shutdown(
         ));
         runtime.note_instance_exit(deployed_key, RuntimeInstanceExit::Success);
     })
+}
+
+fn complete_instance_error_on_shutdown(
+    runtime: Arc<ControllerRuntime<()>>,
+    mut receiver: RuntimeCtrlMsgReceiver<()>,
+    deployed_key: DeployedPipelineKey,
+    expected_reason: &'static str,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        assert!(matches!(
+            wait_for_shutdown_message(&mut receiver),
+            RuntimeControlMsg::Shutdown { reason, .. } if reason == expected_reason
+        ));
+        runtime.note_instance_exit(
+            deployed_key,
+            RuntimeInstanceExit::Error(RuntimeInstanceError::runtime(
+                "simulated shutdown error".to_owned(),
+            )),
+        );
+    })
+}
+
+#[derive(Clone, Copy)]
+enum UndesiredInstanceScenario {
+    AlreadyExitedWithError,
+    ExitsWithErrorAfterShutdown,
+    RemainsActive,
+}
+
+struct UndesiredInstanceHarness {
+    _receiver: Option<RuntimeCtrlMsgReceiver<()>>,
+    exit_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl UndesiredInstanceHarness {
+    fn join(self) {
+        if let Some(exit_thread) = self.exit_thread {
+            exit_thread
+                .join()
+                .expect("undesired instance exit helper should not panic");
+        }
+    }
+}
+
+fn install_undesired_instance(
+    runtime: &Arc<ControllerRuntime<()>>,
+    key: &DeployedPipelineKey,
+    scenario: UndesiredInstanceScenario,
+    shutdown_reason: &'static str,
+) -> UndesiredInstanceHarness {
+    let lifecycle = match scenario {
+        UndesiredInstanceScenario::AlreadyExitedWithError => {
+            RuntimeInstanceLifecycle::Exited(RuntimeInstanceExit::Error(
+                RuntimeInstanceError::runtime("simulated preexisting error exit".to_owned()),
+            ))
+        }
+        UndesiredInstanceScenario::ExitsWithErrorAfterShutdown
+        | UndesiredInstanceScenario::RemainsActive => RuntimeInstanceLifecycle::Active,
+    };
+    let receiver = register_runtime_instance(
+        runtime,
+        key.pipeline_group_id.as_ref(),
+        key.pipeline_id.as_ref(),
+        key.core_id,
+        key.deployment_generation,
+        lifecycle,
+    );
+
+    match scenario {
+        UndesiredInstanceScenario::AlreadyExitedWithError => UndesiredInstanceHarness {
+            _receiver: None,
+            exit_thread: None,
+        },
+        UndesiredInstanceScenario::ExitsWithErrorAfterShutdown => UndesiredInstanceHarness {
+            _receiver: None,
+            exit_thread: Some(complete_instance_error_on_shutdown(
+                Arc::clone(runtime),
+                receiver,
+                key.clone(),
+                shutdown_reason,
+            )),
+        },
+        UndesiredInstanceScenario::RemainsActive => UndesiredInstanceHarness {
+            _receiver: Some(receiver),
+            exit_thread: None,
+        },
+    }
 }
 
 fn terminal_rollout_record(
@@ -1131,8 +1565,8 @@ connections:
     assert!(plan.removed_assigned_cores.is_empty());
     assert_eq!(plan.resize_start_cores, vec![1]);
     assert!(plan.resize_stop_cores.is_empty());
-    assert_eq!(plan.target_generation, 0);
-    assert_eq!(plan.target_placement.listener_group_snapshot.generation, 1);
+    assert_eq!(plan.target_deployment.baseline_generation, 0);
+    assert_eq!(plan.target_deployment.listener_group_snapshot.generation, 1);
     assert_eq!(
         plan.rollout
             .cores
@@ -1197,7 +1631,7 @@ groups:
     .expect("startup placement should resolve");
 
     for (pipeline, placement) in resolved.iter().cloned().zip(placement_snapshot.pipelines) {
-        runtime.register_committed_pipeline(pipeline, placement, 0);
+        register_committed_pipeline(&runtime, pipeline, placement, 0);
     }
     for core_id in 4..=7 {
         let _receiver = register_runtime_instance(
@@ -1300,7 +1734,7 @@ groups:
     .expect("startup placement should resolve");
 
     for (pipeline, placement) in resolved.iter().cloned().zip(placement_snapshot.pipelines) {
-        runtime.register_committed_pipeline(pipeline, placement, 0);
+        register_committed_pipeline(&runtime, pipeline, placement, 0);
     }
     for core_id in 0..=1 {
         let _receiver = register_runtime_instance(
@@ -1473,7 +1907,7 @@ groups:
     .expect("startup placement should resolve");
 
     for (pipeline, placement) in resolved.iter().cloned().zip(placement_snapshot.pipelines) {
-        runtime.register_committed_pipeline(pipeline, placement, 0);
+        register_committed_pipeline(&runtime, pipeline, placement, 0);
     }
     for core_id in 2..=3 {
         let _receiver = register_runtime_instance(
@@ -1616,7 +2050,7 @@ groups:
     .expect("startup placement should resolve");
 
     for (pipeline, placement) in resolved.iter().cloned().zip(placement_snapshot.pipelines) {
-        runtime.register_committed_pipeline(pipeline, placement, 0);
+        register_committed_pipeline(&runtime, pipeline, placement, 0);
     }
 
     let p2_resize = PipelineConfig::from_yaml(
@@ -1753,7 +2187,7 @@ groups:
     .expect("startup placement should resolve");
 
     for (pipeline, placement) in resolved.iter().cloned().zip(placement_snapshot.pipelines) {
-        runtime.register_committed_pipeline(pipeline, placement, 0);
+        register_committed_pipeline(&runtime, pipeline, placement, 0);
     }
 
     let p2_resize = PipelineConfig::from_yaml(
@@ -1940,7 +2374,8 @@ connections:
                 && pipeline.pipeline_id.as_ref() == "p3"
         })
         .expect("p3 should resolve");
-    runtime.register_committed_pipeline(
+    register_committed_pipeline(
+        &runtime,
         p3_resolved,
         PipelinePlacement {
             pipeline_group_id: "g1".to_owned().into(),
@@ -2052,7 +2487,7 @@ connections:
             },
         )
         .expect("resize to four should be planned");
-    runtime.commit_pipeline_record(&committed_plan, committed_plan.target_generation);
+    runtime.commit_pipeline_deployment(&committed_plan);
 
     assert!(matches!(
         runtime.insert_rollout_plan(&stale_plan),
@@ -2246,9 +2681,9 @@ connections:
         .expect("listener pipeline should be planned");
 
     assert_eq!(plan.target_assigned_cores, vec![4, 5]);
-    assert_eq!(plan.target_placement.placement.core_count(), 2);
+    assert_eq!(plan.target_deployment.placement.core_count(), 2);
     assert_eq!(
-        plan.target_placement
+        plan.target_deployment
             .placement
             .cores
             .iter()
@@ -2257,7 +2692,7 @@ connections:
         vec![(4, Some(1)), (5, Some(1))]
     );
 
-    let snapshot = &plan.target_placement.listener_group_snapshot;
+    let snapshot = &plan.target_deployment.listener_group_snapshot;
     assert_eq!(snapshot.generation, 1);
     assert_eq!(snapshot.plans.len(), 1);
     let listener_plan = snapshot
@@ -2347,11 +2782,11 @@ connections:
         .expect("resize should be planned");
 
     assert_eq!(plan.action, RolloutAction::Replace);
-    assert_eq!(plan.target_generation, 1);
+    assert_eq!(plan.target_deployment.baseline_generation, 1);
     assert!(plan.resize_start_cores.is_empty());
     assert!(plan.resize_stop_cores.is_empty());
-    assert_eq!(plan.target_placement.listener_group_snapshot.generation, 1);
-    let listener_plan = plan.target_placement.listener_group_snapshot.plans[0].clone();
+    assert_eq!(plan.target_deployment.listener_group_snapshot.generation, 1);
+    let listener_plan = plan.target_deployment.listener_group_snapshot.plans[0].clone();
     assert_eq!(
         listener_plan
             .expected_members
@@ -2432,15 +2867,15 @@ connections:
         .expect("listener scale-down should be planned");
 
     assert_eq!(plan.action, RolloutAction::Replace);
-    assert_eq!(plan.target_generation, 1);
+    assert_eq!(plan.target_deployment.baseline_generation, 1);
     assert_eq!(plan.current_assigned_cores, vec![0, 1, 2]);
     assert_eq!(plan.target_assigned_cores, vec![0, 1]);
     assert_eq!(plan.removed_assigned_cores, vec![2]);
     assert!(plan.resize_start_cores.is_empty());
     assert!(plan.resize_stop_cores.is_empty());
-    assert_eq!(plan.target_placement.listener_group_snapshot.generation, 1);
+    assert_eq!(plan.target_deployment.listener_group_snapshot.generation, 1);
     assert_eq!(
-        plan.target_placement.listener_group_snapshot.plans[0]
+        plan.target_deployment.listener_group_snapshot.plans[0]
             .expected_members
             .iter()
             .map(|member| member.core_id)
@@ -2525,8 +2960,8 @@ connections:
     assert_eq!(plan.removed_assigned_cores, vec![1]);
     assert!(plan.resize_start_cores.is_empty());
     assert_eq!(plan.resize_stop_cores, vec![1]);
-    assert_eq!(plan.target_generation, 0);
-    assert_eq!(plan.target_placement.listener_group_snapshot.generation, 1);
+    assert_eq!(plan.target_deployment.baseline_generation, 0);
+    assert_eq!(plan.target_deployment.listener_group_snapshot.generation, 1);
     assert_eq!(
         plan.rollout
             .cores
@@ -2603,8 +3038,8 @@ connections:
         .expect("identical updates should be planned");
 
     assert_eq!(plan.action, RolloutAction::NoOp);
-    assert_eq!(plan.target_generation, 0);
-    assert_eq!(plan.target_placement.listener_group_snapshot.generation, 0);
+    assert_eq!(plan.target_deployment.baseline_generation, 0);
+    assert_eq!(plan.target_deployment.listener_group_snapshot.generation, 0);
     assert!(plan.rollout.cores.is_empty());
     assert!(plan.resize_start_cores.is_empty());
     assert!(plan.resize_stop_cores.is_empty());
@@ -2777,7 +3212,7 @@ connections:
         .expect("scope-only limiter change should be planned");
 
     assert_eq!(plan.action, RolloutAction::NoOp);
-    assert_eq!(plan.target_generation, 0);
+    assert_eq!(plan.target_deployment.baseline_generation, 0);
     assert!(plan.rollout.cores.is_empty());
 }
 
@@ -2936,7 +3371,7 @@ connections:
         .expect("runtime shape changes should still be planned");
 
     assert_eq!(plan.action, RolloutAction::Replace);
-    assert_eq!(plan.target_generation, 1);
+    assert_eq!(plan.target_deployment.baseline_generation, 1);
     assert_eq!(plan.common_assigned_cores, vec![0]);
     assert_eq!(plan.added_assigned_cores, vec![1]);
     assert!(plan.resize_start_cores.is_empty());
@@ -3028,8 +3463,9 @@ connections:
         .expect_err("topic runtime changes should be rejected");
 
     match err {
-        ControlPlaneError::InvalidRequest { message } => {
-            assert!(message.contains("topic broker mutation"));
+        ControlPlaneError::UnsupportedMutation { message } => {
+            assert!(message.contains("topic broker configuration"));
+            assert!(message.contains("restart required"));
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -3374,13 +3810,13 @@ connections:
         .insert_rollout(&plan.pipeline_key, plan.rollout.clone())
         .expect("rollout should register");
 
-    let candidate_key = deployed_key("g1", "p1", 0, plan.target_generation);
+    let candidate_key = deployed_key("g1", "p1", 0, plan.target_deployment.baseline_generation);
     let mut candidate_rx = register_runtime_instance(
         &runtime,
         "g1",
         "p1",
         0,
-        plan.target_generation,
+        plan.target_deployment.baseline_generation,
         RuntimeInstanceLifecycle::Active,
     );
 
@@ -3453,14 +3889,14 @@ connections:
     runtime
         .insert_rollout(&plan.pipeline_key, plan.rollout.clone())
         .expect("rollout should register");
-    runtime.commit_pipeline_record(&plan, plan.target_generation);
+    runtime.commit_pipeline_deployment(&plan);
 
     let mut candidate_rx = register_runtime_instance(
         &runtime,
         "g1",
         "p1",
         0,
-        plan.target_generation,
+        plan.target_deployment.baseline_generation,
         RuntimeInstanceLifecycle::Active,
     );
 
@@ -3477,12 +3913,730 @@ connections:
     );
 }
 
-/// Scenario: a resize rollback must clean up cores that were already started
-/// before a later step fails.
-/// Guarantees: rollback sends shutdown to those started cores instead of
-/// leaving them running after the rollout fails.
+/// Scenario: a receiver returns a non-panic runtime error before signaling startup readiness.
+/// Guarantees: reconciliation fails deterministically with the receiver's original error and does
+/// not commit the candidate pipeline.
 #[test]
-fn rollback_resize_rollout_cleans_up_started_cores() {
+fn receiver_failure_before_readiness_preserves_error() {
+    let desired = engine_config_with_pipeline(simple_pipeline_yaml());
+    let runtime =
+        test_runtime_with_factory(&empty_engine_config(), &STARTUP_FAILING_PIPELINE_FACTORY);
+
+    let status = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect("reconciliation should report receiver failure");
+
+    assert_eq!(status.state, EngineConfigReconcileState::Failed);
+    assert!(
+        status
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("simulated receiver bind failure")),
+        "unexpected startup reconciliation failure: {:?}",
+        status.failure_reason
+    );
+    assert!(
+        !runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .logical_pipelines
+            .contains_key(&PipelineKey::new("g1".into(), "p1".into())),
+        "failed candidate must not be committed"
+    );
+    assert_eq!(
+        runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_instances,
+        0,
+        "failed candidate must be rolled back"
+    );
+}
+
+/// Scenario: a receiver remains in fallible initialization before explicitly signaling ready.
+/// Guarantees: reconciliation does not commit or complete until the receiver crosses its
+/// startup-readiness boundary.
+#[test]
+fn reconciliation_waits_for_receiver_readiness_signal() {
+    let _delayed_lock = DELAYED_READY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_delayed_ready_receiver();
+
+    let desired = engine_config_with_pipeline(simple_pipeline_yaml());
+    let runtime =
+        test_runtime_with_factory(&empty_engine_config(), &DELAYED_READY_PIPELINE_FACTORY);
+    let _observed_state_runner = ObservedStateRunner::start(&runtime);
+    let reconcile_runtime = Arc::clone(&runtime);
+    let reconcile = thread::spawn(move || {
+        reconcile_runtime
+            .reconcile_engine_config(reconcile_request(desired, true))
+            .expect("reconciliation should complete")
+    });
+
+    let start_deadline = Instant::now() + Duration::from_secs(5);
+    while !DELAYED_READY_RECEIVER_STARTED.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < start_deadline,
+            "receiver did not enter startup"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !reconcile.is_finished(),
+        "reconciliation must still be waiting for receiver readiness"
+    );
+    assert!(
+        !runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .logical_pipelines
+            .contains_key(&PipelineKey::new("g1".into(), "p1".into())),
+        "pipeline must not be committed before receiver readiness"
+    );
+
+    DELAYED_READY_RECEIVER_RELEASED.store(true, Ordering::SeqCst);
+    let reconcile_status = reconcile
+        .join()
+        .expect("reconciliation thread should not panic");
+    assert!(
+        DELAYED_READY_RECEIVER_SIGNALLED.load(Ordering::SeqCst),
+        "receiver did not call signal_ready"
+    );
+    assert_eq!(
+        reconcile_status.state,
+        EngineConfigReconcileState::Succeeded,
+        "unexpected reconciliation result: {:?}",
+        reconcile_status.failure_reason
+    );
+
+    runtime
+        .request_shutdown_all(1)
+        .expect("ready pipeline should accept shutdown");
+    assert!(runtime.wait_for_global_shutdown_completion());
+}
+
+/// Scenario: a runtime exits immediately after crossing the startup-readiness boundary.
+/// Guarantees: the recorded readiness boundary wins over the later exit so rollout can commit and
+/// hand the failure to runtime recovery.
+#[test]
+fn startup_readiness_marker_wins_over_later_runtime_exit() {
+    let runtime = test_runtime(&empty_engine_config());
+    let deployed_key = deployed_key("g1", "p1", 0, 0);
+    let _notifications = register_runtime_instance(
+        &runtime,
+        "g1",
+        "p1",
+        0,
+        0,
+        RuntimeInstanceLifecycle::Exited(RuntimeInstanceExit::Error(
+            RuntimeInstanceError::runtime("failure after ready".to_owned()),
+        )),
+    );
+    runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .runtime_instances
+        .get(&deployed_key)
+        .expect("runtime instance should be registered")
+        .startup_ready
+        .store(true, Ordering::Release);
+
+    runtime
+        .wait_for_pipeline_ready(&deployed_key, Instant::now())
+        .expect("readiness marker should win over a later runtime exit");
+}
+
+fn run_create_undesired_instance_scenario(
+    scenario: UndesiredInstanceScenario,
+) -> Result<(), RolloutExecutionError> {
+    let runtime = test_runtime(&empty_pipeline_group_config());
+    let plan = prepare_rollback_test_plan(&runtime, rollback_test_pipeline_config(1, false), 1, 1);
+    assert_eq!(plan.action, RolloutAction::Create);
+    let key = deployed_key(
+        "g1",
+        "p1",
+        plan.target_assigned_cores[0],
+        plan.target_deployment.baseline_generation,
+    );
+    let harness = install_undesired_instance(&runtime, &key, scenario, "candidate cleanup");
+    let result = runtime.rollback_create_rollout(&plan, &[key], "original failure".to_owned());
+    harness.join();
+    result
+}
+
+fn run_resize_undesired_instance_scenario(
+    scenario: UndesiredInstanceScenario,
+) -> Result<(), RolloutExecutionError> {
+    let config = engine_config_with_pipeline(&rollback_test_pipeline_yaml(1, false));
+    let runtime = test_runtime(&config);
+    register_existing_pipeline(&runtime, &config);
+    let _existing =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+    let plan = prepare_rollback_test_plan(&runtime, rollback_test_pipeline_config(2, false), 1, 1);
+    assert_eq!(plan.action, RolloutAction::Resize);
+    let core_id = plan.resize_start_cores[0];
+    let key = deployed_key(
+        "g1",
+        "p1",
+        core_id,
+        plan.target_deployment.baseline_generation,
+    );
+    let harness = install_undesired_instance(&runtime, &key, scenario, "rollback cleanup");
+    let result =
+        runtime.rollback_resize_rollout(&plan, &[core_id], &[], "original failure".to_owned());
+    harness.join();
+    result
+}
+
+fn run_replace_undesired_instance_scenario(
+    scenario: UndesiredInstanceScenario,
+) -> Result<(), RolloutExecutionError> {
+    let config = engine_config_with_pipeline(&rollback_test_pipeline_yaml(1, false));
+    let runtime = test_runtime(&config);
+    register_existing_pipeline(&runtime, &config);
+    let _existing =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+    let plan = prepare_rollback_test_plan(&runtime, rollback_test_pipeline_config(2, true), 1, 1);
+    assert_eq!(plan.action, RolloutAction::Replace);
+    let core_id = plan.added_assigned_cores[0];
+    let key = deployed_key(
+        "g1",
+        "p1",
+        core_id,
+        plan.target_deployment.baseline_generation,
+    );
+    let harness = install_undesired_instance(&runtime, &key, scenario, "rollback cleanup");
+    let result = runtime.rollback_replace_rollout(
+        &plan,
+        &[],
+        &[core_id],
+        &[],
+        "original failure".to_owned(),
+    );
+    harness.join();
+    result
+}
+
+/// Scenario: create rollback finds an undesired instance already terminated with an error.
+/// Guarantees: confirmed termination satisfies cleanup and preserves the original rollout failure.
+#[test]
+fn create_rollback_accepts_already_terminal_undesired_instance() {
+    assert!(matches!(
+        run_create_undesired_instance_scenario(
+            UndesiredInstanceScenario::AlreadyExitedWithError
+        ),
+        Err(RolloutExecutionError::Failed(reason)) if reason == "original failure"
+    ));
+}
+
+/// Scenario: an undesired create candidate exits with an error after rollback requests shutdown.
+/// Guarantees: the confirmed terminal state satisfies cleanup despite the exit error.
+#[test]
+fn create_rollback_accepts_undesired_instance_error_exit_after_shutdown() {
+    assert!(matches!(
+        run_create_undesired_instance_scenario(
+            UndesiredInstanceScenario::ExitsWithErrorAfterShutdown
+        ),
+        Err(RolloutExecutionError::Failed(reason)) if reason == "original failure"
+    ));
+}
+
+/// Scenario: an undesired create candidate remains active through its shutdown completion window.
+/// Guarantees: create rollback reports rollback failure because termination was not confirmed.
+#[test]
+fn create_rollback_fails_when_undesired_instance_remains_active() {
+    assert!(matches!(
+        run_create_undesired_instance_scenario(UndesiredInstanceScenario::RemainsActive),
+        Err(RolloutExecutionError::RollbackFailed(_))
+    ));
+}
+
+/// Scenario: create rollback cannot confirm the first candidate has stopped while a later
+/// candidate is already terminal.
+/// Guarantees: rollback stops at the failed cleanup, leaves that core at `rollback_starting`, and
+/// does not publish rollback progress for a candidate it did not process.
+#[test]
+fn create_rollback_stops_status_updates_after_cleanup_failure() {
+    let runtime = test_runtime(&empty_pipeline_group_config());
+    let plan = prepare_rollback_test_plan(&runtime, rollback_test_pipeline_config(2, false), 1, 1);
+    assert_eq!(plan.action, RolloutAction::Create);
+    let first_key = deployed_key(
+        "g1",
+        "p1",
+        plan.target_assigned_cores[0],
+        plan.target_deployment.baseline_generation,
+    );
+    let second_key = deployed_key(
+        "g1",
+        "p1",
+        plan.target_assigned_cores[1],
+        plan.target_deployment.baseline_generation,
+    );
+    let first_harness = install_undesired_instance(
+        &runtime,
+        &first_key,
+        UndesiredInstanceScenario::RemainsActive,
+        "candidate cleanup",
+    );
+    let second_harness = install_undesired_instance(
+        &runtime,
+        &second_key,
+        UndesiredInstanceScenario::AlreadyExitedWithError,
+        "candidate cleanup",
+    );
+
+    assert!(matches!(
+        runtime.rollback_create_rollout(
+            &plan,
+            &[first_key.clone(), second_key.clone()],
+            "original failure".to_owned(),
+        ),
+        Err(RolloutExecutionError::RollbackFailed(_))
+    ));
+
+    let status = runtime
+        .rollout_status_snapshot(&plan.rollout.rollout_id)
+        .expect("rollback status should remain queryable");
+    let first_core = status
+        .cores
+        .iter()
+        .find(|core| core.core_id == first_key.core_id)
+        .expect("first core status should exist");
+    let second_core = status
+        .cores
+        .iter()
+        .find(|core| core.core_id == second_key.core_id)
+        .expect("second core status should exist");
+    assert_eq!(first_core.state, "rollback_starting");
+    assert_eq!(second_core.state, "pending");
+
+    first_harness.join();
+    second_harness.join();
+}
+
+/// Scenario: resize rollback finds an undesired instance already terminated with an error.
+/// Guarantees: confirmed termination satisfies cleanup and preserves the original rollout failure.
+#[test]
+fn resize_rollback_accepts_already_terminal_undesired_instance() {
+    assert!(matches!(
+        run_resize_undesired_instance_scenario(
+            UndesiredInstanceScenario::AlreadyExitedWithError
+        ),
+        Err(RolloutExecutionError::Failed(reason)) if reason == "original failure"
+    ));
+}
+
+/// Scenario: an undesired resize candidate exits with an error after rollback requests shutdown.
+/// Guarantees: the confirmed terminal state satisfies cleanup despite the exit error.
+#[test]
+fn resize_rollback_accepts_undesired_instance_error_exit_after_shutdown() {
+    assert!(matches!(
+        run_resize_undesired_instance_scenario(
+            UndesiredInstanceScenario::ExitsWithErrorAfterShutdown
+        ),
+        Err(RolloutExecutionError::Failed(reason)) if reason == "original failure"
+    ));
+}
+
+/// Scenario: an undesired resize candidate remains active through its shutdown completion window.
+/// Guarantees: resize rollback reports rollback failure because termination was not confirmed.
+#[test]
+fn resize_rollback_fails_when_undesired_instance_remains_active() {
+    assert!(matches!(
+        run_resize_undesired_instance_scenario(UndesiredInstanceScenario::RemainsActive),
+        Err(RolloutExecutionError::RollbackFailed(_))
+    ));
+}
+
+/// Scenario: replace rollback finds an undesired instance already terminated with an error.
+/// Guarantees: confirmed termination satisfies cleanup and preserves the original rollout failure.
+#[test]
+fn replace_rollback_accepts_already_terminal_undesired_instance() {
+    assert!(matches!(
+        run_replace_undesired_instance_scenario(
+            UndesiredInstanceScenario::AlreadyExitedWithError
+        ),
+        Err(RolloutExecutionError::Failed(reason)) if reason == "original failure"
+    ));
+}
+
+/// Scenario: an undesired replace candidate exits with an error after rollback requests shutdown.
+/// Guarantees: the confirmed terminal state satisfies cleanup despite the exit error.
+#[test]
+fn replace_rollback_accepts_undesired_instance_error_exit_after_shutdown() {
+    assert!(matches!(
+        run_replace_undesired_instance_scenario(
+            UndesiredInstanceScenario::ExitsWithErrorAfterShutdown
+        ),
+        Err(RolloutExecutionError::Failed(reason)) if reason == "original failure"
+    ));
+}
+
+/// Scenario: an undesired replace candidate remains active through its shutdown completion window.
+/// Guarantees: replace rollback reports rollback failure because termination was not confirmed.
+#[test]
+fn replace_rollback_fails_when_undesired_instance_remains_active() {
+    assert!(matches!(
+        run_replace_undesired_instance_scenario(UndesiredInstanceScenario::RemainsActive),
+        Err(RolloutExecutionError::RollbackFailed(_))
+    ));
+}
+
+#[derive(Clone, Copy)]
+enum DesiredInstanceScenario {
+    FailsAfterReadiness,
+    ExitsBeforeReadiness,
+    MissesReadinessDeadline,
+}
+
+fn desired_instance_factory(scenario: DesiredInstanceScenario) -> &'static PipelineFactory<()> {
+    match scenario {
+        DesiredInstanceScenario::FailsAfterReadiness => &READY_THEN_FAILING_PIPELINE_FACTORY,
+        DesiredInstanceScenario::ExitsBeforeReadiness => &STARTUP_FAILING_PIPELINE_FACTORY,
+        DesiredInstanceScenario::MissesReadinessDeadline => &DELAYED_READY_PIPELINE_FACTORY,
+    }
+}
+
+fn reset_delayed_ready_receiver() {
+    DELAYED_READY_RECEIVER_STARTED.store(false, Ordering::SeqCst);
+    DELAYED_READY_RECEIVER_RELEASED.store(false, Ordering::SeqCst);
+    DELAYED_READY_RECEIVER_SIGNALLED.store(false, Ordering::SeqCst);
+}
+
+fn release_delayed_ready_receiver(runtime: &Arc<ControllerRuntime<()>>, key: &DeployedPipelineKey) {
+    DELAYED_READY_RECEIVER_RELEASED.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !DELAYED_READY_RECEIVER_SIGNALLED.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "delayed rollback receiver did not signal readiness"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    runtime
+        .shutdown_instance(key, 1, "delayed readiness test cleanup")
+        .expect("delayed rollback receiver should shut down during test cleanup");
+}
+
+fn run_resize_desired_instance_scenario(
+    scenario: DesiredInstanceScenario,
+) -> Result<(), RolloutExecutionError> {
+    let _delayed_lock =
+        matches!(scenario, DesiredInstanceScenario::MissesReadinessDeadline).then(|| {
+            DELAYED_READY_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+    if matches!(scenario, DesiredInstanceScenario::MissesReadinessDeadline) {
+        reset_delayed_ready_receiver();
+    }
+
+    let config = engine_config_with_pipeline(&rollback_test_pipeline_yaml(2, false));
+    let runtime = test_runtime_with_factory(&config, desired_instance_factory(scenario));
+    register_existing_pipeline(&runtime, &config);
+    let _core0 =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+    let _core1 =
+        register_runtime_instance(&runtime, "g1", "p1", 1, 0, RuntimeInstanceLifecycle::Active);
+    let plan = prepare_rollback_test_plan(&runtime, rollback_test_pipeline_config(1, false), 1, 1);
+    assert_eq!(plan.action, RolloutAction::Resize);
+    let core_id = plan.resize_stop_cores[0];
+    {
+        let mut state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = state
+            .runtime_instances
+            .remove(&deployed_key("g1", "p1", core_id, 0));
+        assert!(removed.is_some(), "retired resize instance should exist");
+        state.active_instances -= 1;
+    }
+
+    let result =
+        runtime.rollback_resize_rollout(&plan, &[], &[core_id], "original failure".to_owned());
+    if matches!(scenario, DesiredInstanceScenario::MissesReadinessDeadline) {
+        release_delayed_ready_receiver(&runtime, &deployed_key("g1", "p1", core_id, 0));
+    }
+    result
+}
+
+fn run_replace_desired_instance_scenario(
+    scenario: DesiredInstanceScenario,
+) -> Result<(), RolloutExecutionError> {
+    let _delayed_lock =
+        matches!(scenario, DesiredInstanceScenario::MissesReadinessDeadline).then(|| {
+            DELAYED_READY_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+    if matches!(scenario, DesiredInstanceScenario::MissesReadinessDeadline) {
+        reset_delayed_ready_receiver();
+    }
+
+    let config = engine_config_with_pipeline(&rollback_test_pipeline_yaml(1, false));
+    let runtime = test_runtime_with_factory(&config, desired_instance_factory(scenario));
+    register_existing_pipeline(&runtime, &config);
+    let _old =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+    let plan = prepare_rollback_test_plan(&runtime, rollback_test_pipeline_config(1, true), 1, 1);
+    assert_eq!(plan.action, RolloutAction::Replace);
+    {
+        let mut state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = state
+            .runtime_instances
+            .remove(&deployed_key("g1", "p1", 0, 0));
+        assert!(removed.is_some(), "replaced instance should exist");
+        state.active_instances -= 1;
+    }
+
+    let target_key = deployed_key("g1", "p1", 0, plan.target_deployment.baseline_generation);
+    let target_rx = register_runtime_instance(
+        &runtime,
+        "g1",
+        "p1",
+        0,
+        plan.target_deployment.baseline_generation,
+        RuntimeInstanceLifecycle::Active,
+    );
+    let target_exit = matches!(scenario, DesiredInstanceScenario::FailsAfterReadiness).then(|| {
+        complete_instance_exit_on_shutdown(
+            Arc::clone(&runtime),
+            target_rx,
+            target_key,
+            "rollback drain",
+        )
+    });
+
+    let result =
+        runtime.rollback_replace_rollout(&plan, &[0], &[], &[], "original failure".to_owned());
+    if let Some(target_exit) = target_exit {
+        target_exit
+            .join()
+            .expect("replacement target exit helper should not panic");
+    }
+    if matches!(scenario, DesiredInstanceScenario::MissesReadinessDeadline) {
+        release_delayed_ready_receiver(&runtime, &deployed_key("g1", "p1", 0, 0));
+    }
+    result
+}
+
+/// Scenario: resize rollback restores a desired instance that fails after signaling readiness.
+/// Guarantees: readiness satisfies restoration and the original rollout failure is preserved.
+#[test]
+fn resize_rollback_accepts_desired_instance_failure_after_readiness() {
+    assert!(matches!(
+        run_resize_desired_instance_scenario(DesiredInstanceScenario::FailsAfterReadiness),
+        Err(RolloutExecutionError::Failed(reason)) if reason == "original failure"
+    ));
+}
+
+/// Scenario: a desired resize rollback instance exits before signaling readiness.
+/// Guarantees: rollback reports rollback failure because restoration never reached readiness.
+#[test]
+fn resize_rollback_fails_when_desired_instance_exits_before_readiness() {
+    assert!(matches!(
+        run_resize_desired_instance_scenario(DesiredInstanceScenario::ExitsBeforeReadiness),
+        Err(RolloutExecutionError::RollbackFailed(_))
+    ));
+}
+
+/// Scenario: a desired resize rollback instance remains active without signaling readiness.
+/// Guarantees: missing the startup deadline produces rollback failure.
+#[test]
+fn resize_rollback_fails_when_desired_instance_misses_readiness_deadline() {
+    assert!(matches!(
+        run_resize_desired_instance_scenario(DesiredInstanceScenario::MissesReadinessDeadline),
+        Err(RolloutExecutionError::RollbackFailed(_))
+    ));
+}
+
+/// Scenario: replace rollback restores a desired instance that fails after signaling readiness.
+/// Guarantees: readiness satisfies restoration and the original rollout failure is preserved.
+#[test]
+fn replace_rollback_accepts_desired_instance_failure_after_readiness() {
+    assert!(matches!(
+        run_replace_desired_instance_scenario(DesiredInstanceScenario::FailsAfterReadiness),
+        Err(RolloutExecutionError::Failed(reason)) if reason == "original failure"
+    ));
+}
+
+/// Scenario: a desired replace rollback instance exits before signaling readiness.
+/// Guarantees: rollback reports rollback failure because restoration never reached readiness.
+#[test]
+fn replace_rollback_fails_when_desired_instance_exits_before_readiness() {
+    assert!(matches!(
+        run_replace_desired_instance_scenario(DesiredInstanceScenario::ExitsBeforeReadiness),
+        Err(RolloutExecutionError::RollbackFailed(_))
+    ));
+}
+
+/// Scenario: a desired replace rollback instance remains active without signaling readiness.
+/// Guarantees: missing the startup deadline produces rollback failure.
+#[test]
+fn replace_rollback_fails_when_desired_instance_misses_readiness_deadline() {
+    assert!(matches!(
+        run_replace_desired_instance_scenario(DesiredInstanceScenario::MissesReadinessDeadline),
+        Err(RolloutExecutionError::RollbackFailed(_))
+    ));
+}
+
+/// Scenario: a create candidate exits before readiness during normal rollout execution.
+/// Guarantees: create enters rollback, confirms candidate termination, and preserves the startup
+/// failure as the rollout result.
+#[test]
+fn create_rollout_cleans_undesired_instances_after_candidate_readiness_failure() {
+    let runtime = test_runtime_with_factory(
+        &empty_pipeline_group_config(),
+        &STARTUP_FAILING_PIPELINE_FACTORY,
+    );
+    let plan = prepare_rollback_test_plan(&runtime, rollback_test_pipeline_config(2, false), 1, 1);
+
+    assert!(matches!(
+        runtime.run_create_rollout(&plan),
+        Err(RolloutExecutionError::Failed(reason))
+            if reason.contains("simulated receiver bind failure")
+    ));
+    assert_eq!(
+        runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_instances,
+        0
+    );
+}
+
+/// Scenario: a resize candidate exits before readiness during normal rollout execution.
+/// Guarantees: resize enters rollback, confirms candidate termination, and preserves the startup
+/// failure as the rollout result.
+#[test]
+fn resize_rollout_cleans_undesired_instances_after_candidate_readiness_failure() {
+    let config = engine_config_with_pipeline(&rollback_test_pipeline_yaml(1, false));
+    let runtime = test_runtime_with_factory(&config, &STARTUP_FAILING_PIPELINE_FACTORY);
+    register_existing_pipeline(&runtime, &config);
+    let _existing =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+    let plan = prepare_rollback_test_plan(&runtime, rollback_test_pipeline_config(2, false), 1, 1);
+
+    assert!(matches!(
+        runtime.run_resize_rollout(&plan),
+        Err(RolloutExecutionError::Failed(reason))
+            if reason.contains("simulated receiver bind failure")
+    ));
+}
+
+/// Scenario: a replace candidate exits before readiness during normal rollout execution.
+/// Guarantees: replace enters rollback, confirms candidate termination, and preserves the startup
+/// failure as the rollout result.
+#[test]
+fn replace_rollout_cleans_undesired_instances_after_candidate_readiness_failure() {
+    let config = engine_config_with_pipeline(&rollback_test_pipeline_yaml(1, false));
+    let runtime = test_runtime_with_factory(&config, &STARTUP_FAILING_PIPELINE_FACTORY);
+    register_existing_pipeline(&runtime, &config);
+    let _existing =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+    let plan = prepare_rollback_test_plan(&runtime, rollback_test_pipeline_config(1, true), 1, 1);
+
+    assert!(matches!(
+        runtime.run_replace_rollout(&plan),
+        Err(RolloutExecutionError::Failed(reason))
+            if reason.contains("simulated receiver bind failure")
+    ));
+}
+
+/// Scenario: create rollback encounters an already-terminal candidate before another candidate
+/// that is still running.
+/// Guarantees: rollback accepts the terminal error, shuts down the active candidate, marks both
+/// cores rolled back, and preserves the original rollout failure.
+#[test]
+fn create_rollback_cleans_active_candidate_after_already_terminal_candidate() {
+    let runtime = test_runtime(&empty_pipeline_group_config());
+    let plan = prepare_rollback_test_plan(&runtime, rollback_test_pipeline_config(2, false), 1, 1);
+    assert_eq!(plan.action, RolloutAction::Create);
+    let terminal_key = deployed_key(
+        "g1",
+        "p1",
+        plan.target_assigned_cores[0],
+        plan.target_deployment.baseline_generation,
+    );
+    let active_key = deployed_key(
+        "g1",
+        "p1",
+        plan.target_assigned_cores[1],
+        plan.target_deployment.baseline_generation,
+    );
+    let _terminal = register_runtime_instance(
+        &runtime,
+        "g1",
+        "p1",
+        terminal_key.core_id,
+        terminal_key.deployment_generation,
+        RuntimeInstanceLifecycle::Exited(RuntimeInstanceExit::Error(
+            RuntimeInstanceError::runtime("receiver bind failure".to_owned()),
+        )),
+    );
+    let active_rx = register_runtime_instance(
+        &runtime,
+        "g1",
+        "p1",
+        active_key.core_id,
+        active_key.deployment_generation,
+        RuntimeInstanceLifecycle::Active,
+    );
+    let exit_thread = complete_instance_exit_on_shutdown(
+        Arc::clone(&runtime),
+        active_rx,
+        active_key.clone(),
+        "candidate cleanup",
+    );
+
+    let result = runtime.rollback_create_rollout(
+        &plan,
+        &[terminal_key.clone(), active_key.clone()],
+        "receiver bind failure".to_owned(),
+    );
+
+    assert!(matches!(
+        result,
+        Err(RolloutExecutionError::Failed(reason)) if reason == "receiver bind failure"
+    ));
+    exit_thread
+        .join()
+        .expect("create rollback shutdown helper should join cleanly");
+    assert!(matches!(
+        runtime.instance_exit(&terminal_key),
+        Some(RuntimeInstanceExit::Error(error)) if error.message == "receiver bind failure"
+    ));
+    assert!(matches!(
+        runtime.instance_exit(&active_key),
+        Some(RuntimeInstanceExit::Success)
+    ));
+    let status = runtime
+        .rollout_status_snapshot(&plan.rollout.rollout_id)
+        .expect("rollback status should remain queryable");
+    assert!(
+        status.cores.iter().all(|core| core.state == "rolled_back"),
+        "both processed candidates should be reported as rolled back"
+    );
+}
+
+/// Scenario: resize rollback encounters an already-exited candidate before another candidate that
+/// is still running.
+/// Guarantees: rollback continues cleanup, leaves no candidate running, preserves the previous
+/// deployment, and reports the original startup error.
+#[test]
+fn resize_rollback_cleans_active_candidate_after_already_terminal_candidate() {
     let config = engine_config_with_pipeline(
         r#"
         policies:
@@ -3515,7 +4669,7 @@ policies:
   resources:
     core_allocation:
       type: core_count
-      count: 2
+      count: 3
 nodes:
   receiver:
     type: "urn:test:receiver:example"
@@ -3544,13 +4698,14 @@ connections:
         .insert_rollout(&plan.pipeline_key, plan.rollout.clone())
         .expect("rollout should register");
 
-    let started_key = deployed_key("g1", "p1", 1, plan.target_generation);
+    let previous_key = deployed_key("g1", "p1", 0, 0);
+    let started_key = deployed_key("g1", "p1", 1, plan.target_deployment.baseline_generation);
     let started_rx = register_runtime_instance(
         &runtime,
         "g1",
         "p1",
         1,
-        plan.target_generation,
+        plan.target_deployment.baseline_generation,
         RuntimeInstanceLifecycle::Active,
     );
     let exit_thread = complete_instance_exit_on_shutdown(
@@ -3559,12 +4714,24 @@ connections:
         started_key.clone(),
         "rollback cleanup",
     );
+    let failed_key = deployed_key("g1", "p1", 2, plan.target_deployment.baseline_generation);
+    let _failed = register_runtime_instance(
+        &runtime,
+        "g1",
+        "p1",
+        2,
+        plan.target_deployment.baseline_generation,
+        RuntimeInstanceLifecycle::Exited(RuntimeInstanceExit::Error(
+            RuntimeInstanceError::runtime("receiver bind failure".to_owned()),
+        )),
+    );
 
-    let result = runtime.rollback_resize_rollout(&plan, &[1], &[], "boom".to_owned());
+    let result =
+        runtime.rollback_resize_rollout(&plan, &[1, 2], &[], "receiver bind failure".to_owned());
 
     assert!(matches!(
         result,
-        Err(RolloutExecutionError::Failed(reason)) if reason == "boom"
+        Err(RolloutExecutionError::Failed(reason)) if reason == "receiver bind failure"
     ));
     exit_thread
         .join()
@@ -3573,14 +4740,27 @@ connections:
         runtime.instance_exit(&started_key),
         Some(RuntimeInstanceExit::Success)
     ));
+    assert!(matches!(
+        runtime.instance_exit(&failed_key),
+        Some(RuntimeInstanceExit::Error(error)) if error.message == "receiver bind failure"
+    ));
+    assert!(runtime.instance_exit(&previous_key).is_none());
+    let state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        state.logical_pipelines[&plan.pipeline_key].baseline_generation,
+        0
+    );
 }
 
-/// Scenario: a replace rollback must clean up added candidate cores that were
-/// already serving the target generation before a later step fails.
-/// Guarantees: rollback sends shutdown to those activated added cores instead
-/// of leaving the candidate generation running.
+/// Scenario: replace rollback encounters an already-exited candidate before another candidate that
+/// is still running.
+/// Guarantees: rollback continues cleanup, leaves no candidate running, restores the previous
+/// deployment, and reports the original startup error.
 #[test]
-fn rollback_replace_rollout_cleans_up_activated_added_cores() {
+fn replace_rollback_cleans_active_candidate_after_already_terminal_candidate() {
     let config = engine_config_with_pipeline(
         r#"
         policies:
@@ -3613,7 +4793,7 @@ policies:
   resources:
     core_allocation:
       type: core_count
-      count: 2
+      count: 3
 nodes:
   input:
     type: "urn:test:receiver:example"
@@ -3642,13 +4822,14 @@ connections:
         .insert_rollout(&plan.pipeline_key, plan.rollout.clone())
         .expect("rollout should register");
 
-    let added_key = deployed_key("g1", "p1", 1, plan.target_generation);
+    let previous_key = deployed_key("g1", "p1", 0, 0);
+    let added_key = deployed_key("g1", "p1", 1, plan.target_deployment.baseline_generation);
     let added_rx = register_runtime_instance(
         &runtime,
         "g1",
         "p1",
         1,
-        plan.target_generation,
+        plan.target_deployment.baseline_generation,
         RuntimeInstanceLifecycle::Active,
     );
     let exit_thread = complete_instance_exit_on_shutdown(
@@ -3657,12 +4838,29 @@ connections:
         added_key.clone(),
         "rollback cleanup",
     );
+    let failed_key = deployed_key("g1", "p1", 2, plan.target_deployment.baseline_generation);
+    let _failed = register_runtime_instance(
+        &runtime,
+        "g1",
+        "p1",
+        2,
+        plan.target_deployment.baseline_generation,
+        RuntimeInstanceLifecycle::Exited(RuntimeInstanceExit::Error(
+            RuntimeInstanceError::runtime("receiver bind failure".to_owned()),
+        )),
+    );
 
-    let result = runtime.rollback_replace_rollout(&plan, &[], &[1], &[], "boom".to_owned());
+    let result = runtime.rollback_replace_rollout(
+        &plan,
+        &[],
+        &[1, 2],
+        &[],
+        "receiver bind failure".to_owned(),
+    );
 
     assert!(matches!(
         result,
-        Err(RolloutExecutionError::Failed(reason)) if reason == "boom"
+        Err(RolloutExecutionError::Failed(reason)) if reason == "receiver bind failure"
     ));
     exit_thread
         .join()
@@ -3671,6 +4869,19 @@ connections:
         runtime.instance_exit(&added_key),
         Some(RuntimeInstanceExit::Success)
     ));
+    assert!(matches!(
+        runtime.instance_exit(&failed_key),
+        Some(RuntimeInstanceExit::Error(error)) if error.message == "receiver bind failure"
+    ));
+    assert!(runtime.instance_exit(&previous_key).is_none());
+    let state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        state.logical_pipelines[&plan.pipeline_key].baseline_generation,
+        0
+    );
 }
 
 /// Scenario: a replace rollout starts with one recovered core on generation 1
@@ -3992,9 +5203,16 @@ fn delete_pipeline_recompiles_context_bindings_without_removed_declarations() {
     let placement = runtime
         .pipeline_placement_for_resolved(&resolved)
         .expect("resolved pipeline placement should exist");
-    let live_placement = runtime.live_pipeline_placement_from(&resolved, placement.clone(), 0);
-    runtime.register_committed_pipeline(resolved.clone(), placement, 0);
-    let core_id = live_placement
+    register_committed_pipeline(&runtime, resolved.clone(), placement, 0);
+    let deployment = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .logical_pipelines
+        .get(&PipelineKey::new("g1".into(), "p1".into()))
+        .cloned()
+        .expect("committed deployment should exist");
+    let core_id = deployment
         .placement
         .cores
         .first()
@@ -4002,14 +5220,9 @@ fn delete_pipeline_recompiles_context_bindings_without_removed_declarations() {
         .core_id
         .id;
     let _deployed_key = runtime
-        .launch_regular_pipeline_instance(
-            &resolved,
-            Arc::clone(&initial_bindings),
-            &live_placement,
-            core_id,
-            0,
-        )
+        .launch_regular_pipeline_instance(&deployment, core_id, 0)
         .expect("pipeline should launch");
+    drop(deployment);
     let installed_bindings = wait_for_context_bindings_test_capture();
     assert!(Arc::ptr_eq(
         &initial_bindings,
@@ -4741,7 +5954,10 @@ fn reconcile_engine_config_preserves_generation_for_context_declaration_changes(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pipeline_key = PipelineKey::new("g1".into(), "p1".into());
-        assert_eq!(state.logical_pipelines[&pipeline_key].active_generation, 0);
+        assert_eq!(
+            state.logical_pipelines[&pipeline_key].baseline_generation,
+            0
+        );
         assert_eq!(state.generation_counters[&pipeline_key], 1);
     }
 }
@@ -4837,13 +6053,13 @@ fn initial_config_activation_applies_log_level_before_noop_reconciliation() {
     assert_eq!(event_count.load(Ordering::SeqCst), 1);
 }
 
-/// Scenario: a full-config reconciliation request omits live stopped
-/// resources with `delete_missing` enabled.
-/// Guarantees: reconciliation deletes the omitted pipeline and then the
-/// now-empty group from committed live config.
+/// Scenario: a full-config reconciliation request omits a stopped pipeline and
+/// its policy-bearing group with `delete_missing` enabled.
+/// Guarantees: reconciliation deletes the omitted pipeline and group instead
+/// of treating removal of the group's policy declaration as unsupported.
 #[test]
 fn reconcile_engine_config_deletes_missing_resources_by_default() {
-    let config = engine_config_with_pipeline(simple_pipeline_yaml());
+    let config = engine_config_with_group_policy_and_pipeline();
     let runtime = test_runtime(&config);
 
     let status = runtime
@@ -4963,7 +6179,7 @@ groups:
 /// omitting deployed pipeline p2 with context declarations.
 /// Guarantees: `delete_missing=false` plans p1 as a no-op and retains p2.
 #[test]
-fn reconcile_engine_config_preserves_missing_resources_when_requested() {
+fn reconcile_engine_config_preserves_missing_context_pipeline() {
     let desired_config = engine_config_with_pipeline(
         r#"
         policies:
@@ -5020,6 +6236,34 @@ fn reconcile_engine_config_preserves_missing_resources_when_requested() {
     }
 }
 
+/// Scenario: a full-config reconciliation request omits a pipeline and its
+/// policy-bearing group with `delete_missing` disabled.
+/// Guarantees: reconciliation preserves the omitted pipeline, group, and
+/// group policy.
+#[test]
+fn reconcile_engine_config_preserves_missing_resources_when_requested() {
+    let config = engine_config_with_group_policy_and_pipeline();
+    let runtime = test_runtime(&config);
+
+    let status = runtime
+        .reconcile_engine_config(reconcile_request(empty_engine_config(), false))
+        .expect("missing resources should be preserved");
+
+    assert_eq!(status.state, EngineConfigReconcileState::Succeeded);
+    assert!(status.changes.is_empty());
+    let snapshot = runtime.engine_config_snapshot();
+    assert!(
+        snapshot.groups[&PipelineGroupId::from("g1")]
+            .pipelines
+            .contains_key(&PipelineId::from("p1"))
+    );
+    assert!(
+        snapshot.groups[&PipelineGroupId::from("g1")]
+            .policies
+            .is_some()
+    );
+}
+
 /// Scenario: full-config reconciliation is rejected after validation because a
 /// target pipeline already has an active rollout.
 /// Guarantees: desired engine-level fields and the active log filter remain
@@ -5053,6 +6297,50 @@ fn reconcile_engine_config_does_not_publish_scaffold_on_conflict() {
     let err = runtime
         .reconcile_engine_config(reconcile_request(desired, true))
         .expect_err("active rollout should reject full-config reconciliation");
+
+    assert_eq!(err, ControlPlaneError::RolloutConflict);
+    assert!(runtime.engine_config_snapshot().engine.custom.is_empty());
+    assert_eq!(log_filter_handle.effective_level().as_str(), "warn");
+}
+
+/// Scenario: full-config reconciliation is attempted while a pipeline not
+/// mentioned in the desired config (and therefore retained under
+/// `delete_missing: false`) has an active rollout in flight.
+/// Guarantees: reconciliation is rejected before `apply_reconcile_success`
+/// can overwrite the live config snapshot, so the in-flight rollout's
+/// eventual update to that pipeline cannot be silently reverted.
+#[test]
+fn reconcile_engine_config_rejects_when_omitted_pipeline_has_active_rollout() {
+    let mut config = engine_config_with_pipeline(simple_pipeline_yaml());
+    config.engine.telemetry.logs.level =
+        Some(serde_json::from_value(serde_json::json!("warn")).expect("warn level should parse"));
+    let (runtime, log_filter_handle, _log_filter) =
+        test_runtime_with_log_filter(&config, &TEST_PIPELINE_FACTORY);
+    let pipeline_key = PipelineKey::new("g1".into(), "p1".into());
+    {
+        let mut state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        _ = state
+            .active_rollouts
+            .insert(pipeline_key, "rollout-42".to_owned());
+    }
+
+    // The desired config omits g1/p1 entirely; with `delete_missing: false`
+    // this pipeline should be retained rather than deleted, but it still
+    // must not be silently re-snapshotted while its rollout is in flight.
+    let mut desired = empty_engine_config();
+    desired.engine.telemetry.logs.level =
+        Some(serde_json::from_value(serde_json::json!("info")).expect("info level should parse"));
+    _ = desired
+        .engine
+        .custom
+        .insert("desired".to_owned(), serde_json::json!({"enabled": true}));
+
+    let err = runtime
+        .reconcile_engine_config(reconcile_request(desired, false))
+        .expect_err("active rollout on an omitted pipeline should reject reconciliation");
 
     assert_eq!(err, ControlPlaneError::RolloutConflict);
     assert!(runtime.engine_config_snapshot().engine.custom.is_empty());
@@ -5131,8 +6419,9 @@ groups:
         .expect_err("topic runtime changes should be rejected");
 
     match err {
-        ControlPlaneError::InvalidRequest { message } => {
-            assert!(message.contains("runtime topic broker mutation"));
+        ControlPlaneError::UnsupportedMutation { message } => {
+            assert!(message.contains("topic broker configuration"));
+            assert!(message.contains("restart required"));
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -5294,7 +6583,7 @@ groups:
         };
         let group_id = resolved.pipeline_group_id.as_ref().to_owned();
         let pipeline_id = resolved.pipeline_id.as_ref().to_owned();
-        runtime.register_committed_pipeline(resolved, placement, 0);
+        register_committed_pipeline(&runtime, resolved, placement, 0);
         for core_id in assigned_cores {
             let _rx = register_runtime_instance(
                 &runtime,
@@ -5329,12 +6618,185 @@ groups:
     );
 }
 
-/// Scenario: a detached shutdown worker panics before it reaches the normal
-/// terminal-state bookkeeping path.
-/// Guarantees: the shutdown is forced into a failed terminal state and the
-/// logical pipeline no longer stays blocked by a stale active-shutdown entry.
+/// Scenario: full-config reconciliation changes a startup-owned engine telemetry setting.
+/// Guarantees: the request is rejected before committed configuration diverges from runtime behavior.
+#[test]
+fn reconcile_engine_config_rejects_unsupported_engine_mutation() {
+    let config = empty_engine_config();
+    let runtime = test_runtime(&config);
+    let mut desired = config.clone();
+    desired.engine.telemetry.reporting_interval = Duration::from_secs(5);
+
+    let err = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect_err("startup-owned engine settings should be rejected");
+
+    match err {
+        ControlPlaneError::UnsupportedMutation { message } => {
+            assert!(message.contains("engine configuration"));
+            assert!(message.contains("restart required"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(runtime.engine_config_snapshot(), config);
+}
+
+/// Scenario: one request combines a supported pipeline creation with an unsupported engine change.
+/// Guarantees: admission rejects the complete request before recording a rollout or changing config.
+#[test]
+fn reconcile_engine_config_rejects_mixed_supported_and_unsupported_changes() {
+    let config = empty_engine_config();
+    let runtime = test_runtime(&config);
+    let mut desired = engine_config_with_pipeline(simple_pipeline_yaml());
+    desired.engine.telemetry.reporting_interval = Duration::from_secs(5);
+
+    let err = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect_err("a partially unsupported request should be rejected as a whole");
+
+    assert!(matches!(err, ControlPlaneError::UnsupportedMutation { .. }));
+    let state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(state.rollouts.is_empty());
+    assert_eq!(state.live_config, config);
+}
+
+/// Scenario: full reconciliation changes a top-level policy declaration.
+/// Guarantees: admission rejects the shared-scope mutation and directs the caller to pipeline scope.
+#[test]
+fn reconcile_engine_config_rejects_top_level_policy_mutation() {
+    let config = empty_engine_config();
+    let runtime = test_runtime(&config);
+    let desired = OtelDataflowSpec::from_json(
+        r#"
+{
+    "version": "otel_dataflow/v1",
+    "policies": {
+        "channel_capacity": {
+            "control": { "node": 257, "pipeline": 256 },
+            "pdata": 128
+        }
+    }
+}
+"#,
+    )
+    .expect("policy config should parse");
+
+    let err = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect_err("top-level policy changes should be rejected");
+
+    match err {
+        ControlPlaneError::UnsupportedMutation { message } => {
+            assert!(message.contains("top-level or group policy"));
+            assert!(message.contains("pipeline-level policies"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(runtime.engine_config_snapshot(), config);
+}
+
+/// Scenario: full reconciliation creates an empty group with a policy declaration.
+/// Guarantees: the metadata-only group is committed because no running pipeline inherits it.
+#[test]
+fn reconcile_engine_config_accepts_policy_bearing_empty_group() {
+    let config = empty_engine_config();
+    let runtime = test_runtime(&config);
+    let desired = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+groups:
+    g1:
+        policies:
+            runtime_recovery:
+                max_restarts: 5
+                initial_backoff: 1s
+                max_backoff: 5s
+                startup_timeout: 1s
+                reset_after: 1m
+"#,
+    )
+    .expect("group policy should parse");
+
+    let status = runtime
+        .reconcile_engine_config(reconcile_request(desired.clone(), true))
+        .expect("policy-bearing empty group should reconcile");
+
+    assert_eq!(status.state, EngineConfigReconcileState::Succeeded);
+    assert_eq!(runtime.engine_config_snapshot(), desired);
+}
+
+/// Scenario: full reconciliation adds a group policy inherited by an existing pipeline.
+/// Guarantees: admission rejects the shared-scope runtime mutation before rollout planning.
+#[test]
+fn reconcile_engine_config_rejects_group_policy_change_for_existing_pipeline() {
+    let config = engine_config_with_pipeline(simple_pipeline_yaml());
+    let runtime = test_runtime(&config);
+    let desired = engine_config_with_group_policy_and_pipeline();
+
+    let err = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect_err("group policy changes affecting a pipeline should be rejected");
+
+    assert!(matches!(err, ControlPlaneError::UnsupportedMutation { .. }));
+    assert_eq!(runtime.engine_config_snapshot(), config);
+}
+
+/// Scenario: full-config reconciliation changes only application-owned engine metadata.
+/// Guarantees: metadata commits without requiring a runtime subsystem update.
+#[test]
+fn reconcile_engine_config_accepts_custom_engine_metadata() {
+    let config = empty_engine_config();
+    let runtime = test_runtime(&config);
+    let mut desired = config.clone();
+    _ = desired
+        .engine
+        .custom
+        .insert("fleet".to_owned(), serde_json::json!("canary"));
+
+    let status = runtime
+        .reconcile_engine_config(reconcile_request(desired.clone(), true))
+        .expect("custom engine metadata should reconcile");
+
+    assert_eq!(status.state, EngineConfigReconcileState::Succeeded);
+    assert_eq!(runtime.engine_config_snapshot(), desired);
+}
+
+/// Scenario: full-config reconciliation changes only a declared topic's description.
+/// Guarantees: metadata updates without requiring topic broker mutation or restart.
+#[test]
+fn reconcile_engine_config_accepts_topic_description_metadata() {
+    let config = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+topics:
+  shared: {}
+"#,
+    )
+    .expect("topic config should parse");
+    let runtime = test_runtime(&config);
+    let desired = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+topics:
+  shared:
+    description: "shared telemetry"
+"#,
+    )
+    .expect("topic metadata should parse");
+
+    let status = runtime
+        .reconcile_engine_config(reconcile_request(desired.clone(), true))
+        .expect("topic metadata should reconcile");
+
+    assert_eq!(status.state, EngineConfigReconcileState::Succeeded);
+    assert_eq!(runtime.engine_config_snapshot(), desired);
+}
+
 /// Scenario: full-config reconciliation changes the process-wide memory limiter policy.
-/// Guarantees: live reconciliation rejects startup-owned sampler changes before mutating committed config.
+/// Guarantees: live reconciliation requires restart before mutating committed config.
 #[test]
 fn reconcile_engine_config_rejects_runtime_memory_limiter_mutation() {
     let config = OtelDataflowSpec::from_yaml(
@@ -5400,8 +6862,9 @@ groups:
         .expect_err("memory limiter runtime changes should be rejected");
 
     match err {
-        ControlPlaneError::InvalidRequest { message } => {
-            assert!(message.contains("runtime memory_limiter mutation"));
+        ControlPlaneError::UnsupportedMutation { message } => {
+            assert!(message.contains("process memory limiter"));
+            assert!(message.contains("restart required"));
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -5957,6 +7420,195 @@ fn request_shutdown_all_attempts_all_active_instances_before_returning_error() {
 /// observability sender is not called until every regular instance reports its
 /// terminal exit, preserving their final internal telemetry.
 #[test]
+fn request_shutdown_all_retries_failed_sends() {
+    let runtime = test_runtime(&engine_config_with_pipeline(simple_pipeline_yaml()));
+    let key0 = deployed_key("g1", "p1", 0, 0);
+
+    // Fails on the first try, succeeds on the second try.
+    let (sender0, calls0) = retrying_admin_sender(1);
+
+    register_runtime_instance_with_sender(
+        &runtime,
+        key0.clone(),
+        sender0,
+        RuntimeInstanceLifecycle::Active,
+    );
+
+    // First attempt should fail.
+    let err = runtime
+        .request_shutdown_all(5)
+        .expect_err("shutdown-all should report the failed sender");
+
+    let ControlPlaneError::Internal { message } = err else {
+        panic!("unexpected shutdown-all error: {err:?}");
+    };
+    assert!(message.contains("g1:p1 core=0 generation=0"));
+    assert!(message.contains("simulated send failure"));
+
+    // Sender should still be retained because it failed.
+    let state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        state
+            .runtime_instances
+            .get(&key0)
+            .and_then(|instance| instance.control_sender.as_ref())
+            .is_some(),
+        "failed shutdown send should retain control sender"
+    );
+    drop(state);
+
+    // Second attempt should succeed.
+    runtime
+        .request_shutdown_all(5)
+        .expect("retry should succeed");
+
+    // Sender should now be released.
+    let state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        state
+            .runtime_instances
+            .get(&key0)
+            .and_then(|instance| instance.control_sender.as_ref())
+            .is_none(),
+        "successful shutdown send should release control sender"
+    );
+    drop(state);
+
+    // Should have been called twice.
+    assert_eq!(
+        *calls0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec!["global shutdown".to_owned(), "global shutdown".to_owned()]
+    );
+}
+
+#[test]
+fn register_launched_instance_retries_failed_sends() {
+    let runtime = test_runtime(&engine_config_with_pipeline(simple_pipeline_yaml()));
+    let key0 = deployed_key("g1", "p1", 0, 0);
+
+    // First request global shutdown.
+    let _ = runtime.request_shutdown_all(5);
+
+    // Fails on the first try (during late registration), succeeds on the second try.
+    let (sender0, calls0) = retrying_admin_sender(1);
+
+    let context_bindings = {
+        let state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&state.latest_context_bindings)
+    };
+
+    let launched = LaunchedPipelineThread {
+        pipeline_key: key0.clone(),
+        control_sender: sender0,
+        context_bindings,
+        startup_ready: Arc::new(AtomicBool::new(false)),
+        _marker: std::marker::PhantomData,
+    };
+
+    // Late registration should attempt to send shutdown immediately, which will fail.
+    runtime.register_launched_instance(launched);
+
+    // Sender should still be retained because it failed.
+    let state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        state
+            .runtime_instances
+            .get(&key0)
+            .and_then(|instance| instance.control_sender.as_ref())
+            .is_some(),
+        "failed late-registration shutdown send should retain control sender"
+    );
+    drop(state);
+
+    // Second attempt via explicit request_shutdown_all should succeed.
+    runtime
+        .request_shutdown_all(5)
+        .expect("retry should succeed");
+
+    // Sender should now be released.
+    let state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        state
+            .runtime_instances
+            .get(&key0)
+            .and_then(|instance| instance.control_sender.as_ref())
+            .is_none(),
+        "successful shutdown send should release control sender"
+    );
+    drop(state);
+
+    // Should have been called twice.
+    assert_eq!(
+        *calls0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec![
+            "global shutdown (late registration)".to_owned(),
+            "global shutdown".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn register_launched_instance_respects_global_shutdown_timeout() {
+    let runtime = test_runtime(&engine_config_with_pipeline(simple_pipeline_yaml()));
+    let key0 = deployed_key("g1", "p1", 0, 0);
+
+    // First request global shutdown with a specific timeout.
+    let _ = runtime.request_shutdown_all(30);
+
+    let (sender0, notifications) = deadline_notifying_admin_sender();
+    let context_bindings = {
+        let state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&state.latest_context_bindings)
+    };
+
+    let launched = LaunchedPipelineThread {
+        pipeline_key: key0,
+        control_sender: sender0,
+        context_bindings,
+        startup_ready: Arc::new(AtomicBool::new(false)),
+        _marker: std::marker::PhantomData,
+    };
+
+    // Late registration should immediately receive a shutdown signal.
+    runtime.register_launched_instance(launched);
+
+    let (reason, deadline) = notifications
+        .recv()
+        .expect("should receive shutdown signal");
+    assert_eq!(reason, "global shutdown (late registration)");
+
+    // Deadline should be ~30 seconds from now.
+    let diff = deadline.duration_since(Instant::now());
+    assert!(
+        diff.as_secs() > 25 && diff.as_secs() <= 31,
+        "deadline should respect the original global shutdown timeout (30s), got {}s",
+        diff.as_secs()
+    );
+}
+
+#[test]
 fn request_shutdown_all_stops_observability_after_regular_instances_exit() {
     let runtime = test_runtime(&engine_config_with_pipeline(simple_pipeline_yaml()));
     let regular_key0 = deployed_key("g1", "p1", 0, 0);
@@ -6049,6 +7701,139 @@ fn request_shutdown_all_stops_observability_after_regular_instances_exit() {
     assert!(regular_notifications0.try_recv().is_err());
     assert!(regular_notifications1.try_recv().is_err());
     assert!(observability_notifications.try_recv().is_err());
+}
+
+/// Scenario: regular pipelines have exited but the controller is still reporting final metrics.
+/// Guarantees: the main wait wakes without stopping observability, which shuts down only after
+/// the controller releases its telemetry guard.
+#[test]
+fn request_shutdown_all_waits_for_controller_telemetry() {
+    let runtime = test_runtime(&engine_config_with_pipeline(simple_pipeline_yaml()));
+    let regular_key = deployed_key("g1", "p1", 0, 0);
+    let observability_key = deployed_key(
+        SYSTEM_PIPELINE_GROUP_ID,
+        SYSTEM_OBSERVABILITY_PIPELINE_ID,
+        1,
+        0,
+    );
+    let (regular_sender, _regular_notifications) = notifying_admin_sender();
+    let (observability_sender, notifications) = notifying_admin_sender();
+    register_runtime_instance_with_sender(
+        &runtime,
+        regular_key.clone(),
+        regular_sender,
+        RuntimeInstanceLifecycle::Active,
+    );
+    register_runtime_instance_with_sender(
+        &runtime,
+        observability_key.clone(),
+        observability_sender,
+        RuntimeInstanceLifecycle::Active,
+    );
+    let guard = runtime.hold_controller_telemetry();
+    runtime.request_shutdown_all(5).expect("shutdown accepted");
+    runtime.note_instance_exit(regular_key, RuntimeInstanceExit::Success);
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let waiter_runtime = Arc::clone(&runtime);
+    let waiter = thread::spawn(move || {
+        waiter_runtime.wait_until_global_shutdown_drains_or_released();
+        ready_tx
+            .send(())
+            .expect("controller wait receiver remains open");
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("controller can report before observability exits");
+    waiter.join().expect("controller wait completes");
+    assert!(
+        notifications
+            .recv_timeout(Duration::from_millis(25))
+            .is_err()
+    );
+    assert!(!runtime.all_instances_exited());
+
+    drop(guard);
+    assert_eq!(
+        notifications
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observability shuts down after final reporting"),
+        "global shutdown"
+    );
+    runtime.note_instance_exit(observability_key, RuntimeInstanceExit::Success);
+    assert!(runtime.wait_for_global_shutdown_completion());
+}
+
+/// Scenario: a controller telemetry guard is still held when its deadline expires.
+/// Guarantees: the coordinator does not wait indefinitely and guard drop releases subsequent waits.
+#[test]
+fn controller_telemetry_wait_is_bounded_and_released_on_drop() {
+    let runtime = test_runtime(&empty_engine_config());
+    let guard = runtime.hold_controller_telemetry();
+    assert!(!runtime.wait_for_controller_telemetry(Instant::now()));
+    drop(guard);
+    assert!(runtime.wait_for_controller_telemetry(Instant::now()));
+}
+
+/// Scenario: the coordinator's wait for the controller telemetry guard times out, and the
+/// controller releases the guard only after that coordinator has returned.
+/// Guarantees: the timeout records no run error and sends observability no shutdown, and
+/// a later shutdown request after the guard is released stops observability.
+#[test]
+fn controller_telemetry_timeout_leaves_observability_for_a_later_request() {
+    let runtime = test_runtime(&engine_config_with_pipeline(simple_pipeline_yaml()));
+    let regular_key = deployed_key("g1", "p1", 0, 0);
+    let observability_key = deployed_key(
+        SYSTEM_PIPELINE_GROUP_ID,
+        SYSTEM_OBSERVABILITY_PIPELINE_ID,
+        1,
+        0,
+    );
+    let (regular_sender, _regular_notifications) = notifying_admin_sender();
+    let (observability_sender, notifications) = notifying_admin_sender();
+    register_runtime_instance_with_sender(
+        &runtime,
+        regular_key.clone(),
+        regular_sender,
+        RuntimeInstanceLifecycle::Active,
+    );
+    register_runtime_instance_with_sender(
+        &runtime,
+        observability_key.clone(),
+        observability_sender,
+        RuntimeInstanceLifecycle::Active,
+    );
+    assert!(!runtime.only_observability_active());
+    let guard = runtime.hold_controller_telemetry();
+    runtime.request_shutdown_all(1).expect("shutdown accepted");
+    runtime.note_instance_exit(regular_key, RuntimeInstanceExit::Success);
+
+    // Returns once the coordinator gives up on the guard (1 s timeout plus the test grace).
+    assert!(runtime.wait_for_global_shutdown_completion());
+    assert!(
+        notifications
+            .recv_timeout(Duration::from_millis(25))
+            .is_err()
+    );
+    assert!(runtime.only_observability_active());
+    assert!(
+        runtime.take_runtime_error().is_none(),
+        "a late telemetry handoff is retried, not a run error"
+    );
+
+    drop(guard);
+    runtime
+        .request_shutdown_all(1)
+        .expect("a retry after the guard release is accepted");
+    assert_eq!(
+        notifications
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observability shuts down once the guard is released"),
+        "global shutdown"
+    );
+    runtime.note_instance_exit(observability_key, RuntimeInstanceExit::Success);
+    assert!(runtime.wait_for_global_shutdown_completion());
+    assert!(runtime.all_instances_exited());
 }
 
 /// Scenario: a producer misses its shutdown deadline while observability is still running.
@@ -6807,6 +8592,115 @@ fn runtime_thread_panic_populates_error_source_in_observed_status() {
     assert!(source.contains("thread_id=11"));
     assert!(source.contains("core_id=0"));
     assert!(source.contains("backtrace:"));
+}
+
+static LAUNCH_STARTED: AtomicUsize = AtomicUsize::new(0);
+static LAUNCH_PROCEED: AtomicBool = AtomicBool::new(true);
+
+fn blocking_create(
+    _pipeline_ctx: PipelineContext,
+    node: otel_arrow_dfe_engine::node::NodeId,
+    node_config: Arc<NodeUserConfig>,
+    receiver_config: &ReceiverConfig,
+    _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
+) -> Result<ReceiverWrapper<()>, otel_arrow_dfe_config::error::Error> {
+    if !LAUNCH_PROCEED.load(Ordering::SeqCst) {
+        let _ = LAUNCH_STARTED.fetch_add(1, Ordering::SeqCst);
+        while !LAUNCH_PROCEED.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(ReceiverWrapper::local(
+        RecoveryTestReceiver,
+        node,
+        node_config,
+        receiver_config,
+    ))
+}
+
+/// Scenario: shutdown is requested while a pipeline instance is still starting
+/// and has not yet been registered in the controller's runtime instances map.
+/// Guarantees: shutdown completion waits for the launch to finish and register,
+/// so it doesn't incorrectly return early with a 200 OK before the instance
+/// is even tracked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn has_active_instances_checks_multiple_state_fields() {
+    LAUNCH_STARTED.store(0, Ordering::SeqCst);
+    LAUNCH_PROCEED.store(false, Ordering::SeqCst);
+
+    let receiver_factories: &'static [ReceiverFactory<()>] = Box::leak(Box::new(vec![
+        ReceiverFactory {
+            name: "urn:test:receiver:example",
+            create: blocking_create,
+            wiring_contract: WiringContract::UNRESTRICTED,
+            validate_config: test_validate_config,
+            context_declarations: None,
+        },
+        ReceiverFactory {
+            name: "urn:otel:receiver:internal_telemetry",
+            create: test_receiver_create,
+            wiring_contract: WiringContract::UNRESTRICTED,
+            validate_config: test_validate_config,
+            context_declarations: None,
+        },
+    ]));
+    let test_factory = Box::leak(Box::new(PipelineFactory::new(
+        receiver_factories,
+        TEST_PROCESSOR_FACTORIES,
+        RECOVERY_TEST_EXPORTER_FACTORIES,
+        &[],
+    )));
+
+    let config = engine_config_with_pipeline(simple_pipeline_yaml());
+    let runtime = test_runtime_with_factory(&config, test_factory);
+
+    let control_plane = runtime.control_plane();
+    let control_plane_clone = control_plane.clone();
+    let config_clone = config.clone();
+
+    let _reconcile_task = tokio::spawn(async move {
+        let req = reconcile_request(config_clone, false);
+        let _ = control_plane_clone.reconcile_engine_config(req).unwrap();
+    });
+
+    // Wait for the pipeline creation to begin and block
+    let start_wait = Instant::now();
+    while LAUNCH_STARTED.load(Ordering::SeqCst) == 0 {
+        if start_wait.elapsed() > Duration::from_secs(5) {
+            panic!("timeout waiting for launch to start");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // At this point, the instance is launching but NOT yet registered.
+    // The "pending lifecycle work" predicate keeps has_active_instances() true.
+    assert!(control_plane.has_active_instances());
+
+    // Request shutdown concurrently while launch is paused
+    control_plane.shutdown_all(1).unwrap();
+
+    // Verify it does not complete early
+    assert!(control_plane.has_active_instances());
+
+    // Allow the launch to finish, which will now register the instance *after* global_shutdown_requested is true.
+    LAUNCH_PROCEED.store(true, Ordering::SeqCst);
+
+    // The newly registered instance should immediately receive the shutdown message and exit.
+    // We poll has_active_instances until it becomes false (or we timeout).
+    let start = Instant::now();
+    let mut completed = false;
+    while start.elapsed() < Duration::from_secs(5) {
+        if !control_plane.has_active_instances() {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        completed,
+        "Shutdown did not eventually complete after registration race"
+    );
 }
 
 /// Scenario: one core in a two-core regular pipeline exits with a runtime error
@@ -7589,6 +9483,113 @@ fn rollout_planning_cancels_scheduled_runtime_recovery() {
     );
     assert_eq!(state.active_instances, 0);
     assert!(state.first_error.is_none());
+}
+/// Scenario: a pipeline instance registers with the controller *after* `request_shutdown_all`
+/// has already dispatched shutdown to all known instances and the original producer exits.
+/// Guarantees: the observability coordinator waits for the late-registered instance to exit
+/// before shutting down observability, preventing lost terminal telemetry.
+#[test]
+fn request_shutdown_all_waits_for_late_registered_instance_before_stopping_observability() {
+    let runtime = test_runtime(&engine_config_with_pipeline(simple_pipeline_yaml()));
+    let regular_key = deployed_key("g1", "p1", 0, 0);
+    let observability_key = deployed_key(
+        SYSTEM_PIPELINE_GROUP_ID,
+        SYSTEM_OBSERVABILITY_PIPELINE_ID,
+        2,
+        0,
+    );
+    let (regular_sender, regular_notifications) = notifying_admin_sender();
+    let (observability_sender, observability_notifications) = deadline_notifying_admin_sender();
+    register_runtime_instance_with_sender(
+        &runtime,
+        regular_key.clone(),
+        regular_sender,
+        RuntimeInstanceLifecycle::Active,
+    );
+    register_runtime_instance_with_sender(
+        &runtime,
+        observability_key.clone(),
+        observability_sender,
+        RuntimeInstanceLifecycle::Active,
+    );
+
+    // Start global shutdown - dispatches to the one known producer.
+    let shutdown_runtime = Arc::clone(&runtime);
+    let (shutdown_result_tx, shutdown_result_rx) = std::sync::mpsc::channel();
+    let shutdown_thread = thread::spawn(move || {
+        shutdown_result_tx
+            .send(shutdown_runtime.request_shutdown_all(5))
+            .expect("shutdown result receiver should remain open");
+    });
+
+    assert_eq!(
+        regular_notifications
+            .recv_timeout(Duration::from_secs(1))
+            .expect("regular instance should receive shutdown"),
+        "global shutdown"
+    );
+    shutdown_result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("shutdown dispatch should return")
+        .expect("initial shutdown dispatch should succeed");
+    _ = shutdown_thread.join();
+
+    // Observability must not have received shutdown yet (original producer still active).
+    assert!(
+        observability_notifications.try_recv().is_err(),
+        "observability must remain active while regular instances drain"
+    );
+
+    // Simulate a late registration: a new instance registers after shutdown was dispatched.
+    // This mimics a pipeline thread that was still starting when shutdown was requested.
+    let late_key = deployed_key("g1", "p1", 1, 0);
+    let (late_sender, _late_notifications) = notifying_admin_sender();
+    register_runtime_instance_with_sender(
+        &runtime,
+        late_key.clone(),
+        late_sender,
+        RuntimeInstanceLifecycle::Active,
+    );
+
+    {
+        let state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.global_shutdown_requested,
+            "global shutdown should already be flagged"
+        );
+    }
+
+    // Exit the original producer - observability should still wait because the
+    // late-registered instance is still active.
+    runtime.note_instance_exit(regular_key, RuntimeInstanceExit::Success);
+
+    // Give the coordinator thread a moment to check for late registrations.
+    thread::sleep(Duration::from_millis(100));
+
+    assert!(
+        observability_notifications.try_recv().is_err(),
+        "observability must remain active while the late-registered instance is still running"
+    );
+
+    // Now exit the late-registered instance.
+    runtime.note_instance_exit(late_key, RuntimeInstanceExit::Success);
+
+    // Observability should now receive its shutdown.
+    let (reason, _deadline) = observability_notifications
+        .recv_timeout(Duration::from_secs(2))
+        .expect("observability should receive shutdown after all producers (including late) exit");
+    assert_eq!(reason, "global shutdown");
+
+    // Clean up: exit observability and wait for coordinator completion.
+    runtime.note_instance_exit(observability_key, RuntimeInstanceExit::Success);
+    assert!(
+        runtime.wait_for_global_shutdown_completion(),
+        "the phased shutdown coordinator should complete after observability exits"
+    );
+    assert!(runtime.all_instances_exited());
 }
 
 /// Scenario: reconciliation or rollout preparation changes state_dir.

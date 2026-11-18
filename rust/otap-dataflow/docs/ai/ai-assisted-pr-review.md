@@ -29,6 +29,8 @@ If an agent only has time for one focused pass, it should:
 - use `rust/otap-dataflow/scripts/check-async-blocking.sh` from the repository
   root as a review aid when async/runtime paths are touched
 - report only risks supported by the diff, nearby code, or project guidance
+- check changed tests against the [reliable test guidelines][reliable-tests],
+  especially synchronization, clock control, measurement scope, and cleanup
 - state residual risk when no material findings are found
 
 ## Review Posture
@@ -192,6 +194,15 @@ affected layer, plus negative, edge-case, and regression tests when behavior
 changes. Round-trip or integration tests are useful evidence, but should not be
 the only proof when a narrower semantic contract can be tested directly.
 
+Review test reliability using the [reliable test guidelines][reliable-tests].
+Flag concrete dependencies on sleeps or scheduler order, uncontrolled clocks or
+random outcomes, shared fixtures, unscoped global allocation/registry counters,
+and detached background work. Check that timeout guards observe the intended
+condition and that tests preserve the race or ordering contract they claim to
+exercise. Do not accept retries or weakened assertions as a reliability fix.
+Ask for retry-free targeted validation alongside neighboring tests when relevant;
+passing once or only under nextest does not establish shared-process isolation.
+
 For unit tests, prefer a short function-level comment that states:
 
 - `Scenario:` the behavior or state transition being exercised
@@ -217,6 +228,13 @@ Check dependency and feature hygiene:
 - optional functionality should not expand the default build without
   justification
 - target-specific dependencies should be feature- or platform-gated
+- crypto-related dependencies should not silently select a provider through
+  default features
+- provider-specific code should preserve the workspace `crypto-*` feature
+  selection model
+- new direct `ring`, `aws-lc-rs`, `openssl`, or `symcrypt` dependencies should
+  implement the corresponding selectable backend or include a clear
+  justification
 - unreleased commit pins should be temporary, explained, and preferred only when
   a release tag cannot satisfy the requirement
 
@@ -240,3 +258,4 @@ substitute for preserving OTAP architectural invariants.
 
 [item-attributes-guide]: ../telemetry/item-attributes.md
 [metrics-guide]: ../telemetry/metrics-guide.md
+[reliable-tests]: ../../CONTRIBUTING.md#reliable-tests
