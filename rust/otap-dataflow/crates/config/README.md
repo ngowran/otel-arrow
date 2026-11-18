@@ -8,6 +8,7 @@ Configuration model crate for the OTAP Dataflow Engine.
 If you are authoring runtime YAML, start with:
 
 - [`docs/configuration.md`](../../docs/configuration.md)
+- [PData codecs and decode validation](../../docs/codecs.md)
 
 Use the reference model for exact field semantics:
 
@@ -23,11 +24,13 @@ This README focuses on crate-level model and API details.
 
 Main public model types:
 
-- `engine::OtelDataflowSpec`: runtime root spec (`version`, `policies`,
+- `engine::OtelDataflowSpec`: runtime root spec (`version`, `policies`, `codecs`,
   `topics`, `engine`, `groups`)
 - `engine::EngineConfig`: engine-wide section (`engine: ...`)
 - `pipeline_group::PipelineGroupConfig`
-- `pipeline::PipelineConfig`: nodes, connections, optional policies
+- `pipeline::PipelineConfig`: nodes, connections, optional policies and codecs
+- `codecs::CodecsConfig`: optional bindings and named configurations, resolved
+  independently of policies
 - `policy::Policies`: channel-capacity/health/telemetry/resources/transport
   header policy families
 - `topic::TopicSpec`: named inter-pipeline topic specification
@@ -355,14 +358,16 @@ policies:
 
 > [!NOTE]
 > Named transport-header propagation can refer to a composite member with
-> `product_user:othername_id`. The selected member must exist, and every
-> `transport_header_match` condition must have an exact byte-value match.
-> Header names match case-insensitively, duplicate values use any-match
-> semantics, and unrelated value-bearing members are not evaluated.
+> `product_user:othername_id`. The composite is present only when every
+> value-bearing member is present and every `transport_header_match` condition
+> has an exact byte-value match. Header names match case-insensitively, and
+> duplicate condition values use any-match semantics. Qualified propagation
+> reads the receiver-materialized composite snapshot.
 > A qualified selector cannot share its primitive source with another
 > qualified or unqualified entry. Repeated unqualified selectors, including
 > ASCII case variants, are accepted as equivalent.
-> Propagation overrides retain precedence over composite conditions.
+> Primitive transport-header overrides retain precedence over composite
+> conditions.
 > Other composite consumers are not yet wired at runtime.
 
 ## Engine Observability Pipeline

@@ -44,17 +44,16 @@ use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
 use otel_arrow_dfe_engine::ExporterFactory;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
-use otel_arrow_dfe_engine::context_declaration::{
-    ConfigNodeContextDeclaration, ContextConsumerSelector, ContextDeclaration,
-    ContextDeclarationProvider, ContextDomain, ContextEntrySelector, ContextEntrySelectorForm,
-    ContextEntryTarget, NodeContextDeclarations,
-};
 use otel_arrow_dfe_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otel_arrow_dfe_engine::error::Error as EngineError;
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
 use otel_arrow_dfe_engine::local::exporter::{EffectHandler, Exporter};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
+use otel_arrow_dfe_engine::pdata_context::{
+    ConfigNodeContextDeclaration, ContextConsumerSelector, ContextDeclaration,
+    ContextDeclarationProvider, ContextDomain, NodeContextDeclarations,
+};
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
 use otel_arrow_dfe_otap::pdata::{OtapPdata, PdataEffectHandlerExtension};
@@ -360,8 +359,10 @@ pub static KAFKA_EXPORTER_FACTORY: ExporterFactory<OtapPdata> = ExporterFactory 
 };
 
 impl ConfigNodeContextDeclaration for KafkaExporterConfig {
-    fn context_declarations(&self) -> NodeContextDeclarations {
-        [self.traces(), self.metrics(), self.logs()]
+    fn context_declarations(
+        &self,
+    ) -> Result<NodeContextDeclarations, otel_arrow_dfe_config::error::Error> {
+        Ok([self.traces(), self.metrics(), self.logs()]
             .into_iter()
             .flatten()
             .flat_map(|signal| {
@@ -370,26 +371,20 @@ impl ConfigNodeContextDeclaration for KafkaExporterConfig {
                         .topic_from_transport_header()
                         .map(|name| ContextDeclaration::Consumes {
                             selector: ContextConsumerSelector::Entries {
-                                entries: vec![ContextEntrySelector {
-                                    target: ContextEntryTarget::Primitive {
-                                        domain: ContextDomain::TransportHeader,
-                                        name: name.clone(),
-                                    },
-                                    form: ContextEntrySelectorForm::Value,
-                                }]
-                                .into_boxed_slice(),
+                                entries: vec![TopicRouter::topic_read_selector(name)]
+                                    .into_boxed_slice(),
                             },
                         });
                 let partition = signal.partition_by_transport_headers().then_some(
                     ContextDeclaration::Consumes {
-                        selector: ContextConsumerSelector::AllStored {
+                        selector: ContextConsumerSelector::AllCaptured {
                             domain: ContextDomain::TransportHeader,
                         },
                     },
                 );
                 topic.into_iter().chain(partition)
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -558,22 +553,36 @@ impl KafkaExporter {
 
         // Propagate transport headers onto the Kafka record if a propagation
         // policy is configured and the pdata context carries transport headers.
-        if let Some(policy) = effect_handler.propagation_policy()
-            && let Some(transport_headers) = context.transport_headers()
-        {
-            for propagated in policy.propagate(transport_headers) {
-                // Skip propagated headers that collide with the format header.
-                if propagated.header_name == format_header_key {
-                    continue;
+        if let Some(policy) = effect_handler.propagation_policy() {
+            if let Some(transport_headers) = context.transport_headers() {
+                for propagated in
+                    policy.propagate_materialized(transport_headers, context.materialized_context())
+                {
+                    headers = Self::append_kafka_header(headers, format_header_key, propagated);
                 }
-                headers = headers.insert(Header {
-                    key: propagated.header_name,
-                    value: Some(propagated.value),
-                });
+            } else {
+                for propagated in policy.propagate_materialized_only(context.materialized_context())
+                {
+                    headers = Self::append_kafka_header(headers, format_header_key, propagated);
+                }
             }
         }
 
         headers
+    }
+
+    fn append_kafka_header(
+        headers: OwnedHeaders,
+        format_header_key: &str,
+        propagated: otel_arrow_dfe_config::context::transport_policy::PropagatedHeader<'_>,
+    ) -> OwnedHeaders {
+        if propagated.header_name == format_header_key {
+            return headers;
+        }
+        headers.insert(Header {
+            key: propagated.header_name,
+            value: Some(propagated.value),
+        })
     }
 
     /// Encodes a single PData message and enqueues it to Kafka, returning the
@@ -1441,7 +1450,9 @@ pub mod test_support {
         header_wire_name: &str,
         header_value: &str,
     ) -> OtapPdata {
-        use otel_arrow_dfe_config::transport_headers::{TransportHeader, TransportHeaders};
+        use otel_arrow_dfe_config::context::transport_headers::{
+            TransportHeader, TransportHeaders,
+        };
 
         let bytes = Bytes::from_static(b"payload");
         let proto = match signal_type {
@@ -1623,10 +1634,13 @@ pub mod test_support {
         use crate::exporters::kafka_exporter::partitioner::partition_key_from_transport_headers;
         use bytes::Bytes;
         use otel_arrow_dfe_config::ContextEntryName;
-        use otel_arrow_dfe_config::transport_headers::{
+        use otel_arrow_dfe_config::context::policy::{
+            ContextEntryDeclaration, ContextPolicy, ContextScope,
+        };
+        use otel_arrow_dfe_config::context::transport_headers::{
             TransportHeader, TransportHeaders, ValueKind,
         };
-        use otel_arrow_dfe_config::transport_headers_policy::{
+        use otel_arrow_dfe_config::context::transport_policy::{
             HeaderPropagationPolicy, PropagationDefault, PropagationSelector,
             PropagationSelectorType,
         };
@@ -1644,8 +1658,8 @@ pub mod test_support {
         use crate::common::kafka::test::{run_on_local_set, with_cluster};
 
         // Engine/telemetry helpers used by send and header-propagation tests.
-        use otel_arrow_dfe_engine::context_declaration::CompiledHeaderPropagationPolicy;
         use otel_arrow_dfe_engine::local::exporter::EffectHandler;
+        use otel_arrow_dfe_engine::pdata_context::CompiledHeaderPropagationPolicy;
         use otel_arrow_dfe_engine::runtime_services::{
             CodecEffectHandler, PipelineRuntimeServices,
         };
@@ -1674,7 +1688,7 @@ pub mod test_support {
         use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::{
             ResourceSpans, ScopeSpans, Span,
         };
-        use otel_arrow_dfe_pdata_codec::{DecodePolicy, DecodeValidation, OtapPayload};
+        use otel_arrow_dfe_pdata_codec::OtapPayload;
 
         // Construct once per test pipeline so sends share codec state and a startup plan.
         fn test_runtime(
@@ -1726,9 +1740,15 @@ pub mod test_support {
                     );
                     let mut exporter = KafkaExporter::new(pipeline_context(), config).unwrap();
                     let reporter = RecordingReporter::new();
-                    let services =
-                        PipelineRuntimeServices::new(DecodePolicy::new(DecodeValidation::Strict))
-                            .unwrap();
+                    let services = PipelineRuntimeServices::new(
+                        otel_arrow_dfe_config::codecs::CodecsConfig::resolve([
+                            &serde_yaml::from_str::<otel_arrow_dfe_config::codecs::CodecsConfig>(
+                                "bindings: {otlp-bytes: {decode: {validation: strict}}}",
+                            )
+                            .unwrap(),
+                        ]),
+                    )
+                    .unwrap();
                     let (effect_handler, encoding_plan) = test_runtime(services);
                     let codecs = effect_handler.codec_service();
                     let codec = codecs.registry().resolve(&PdataEncoding::OTLP).unwrap();
@@ -1791,6 +1811,11 @@ pub mod test_support {
         /// Guarantees: both context reads are declared.
         #[test]
         fn declarations_use_generic_bindings() {
+            use otel_arrow_dfe_engine::pdata_context::{
+                ContextEntrySelector, ContextEntrySelectorForm, ContextEntryTake,
+                ContextEntryTarget, ContextNameMatching,
+            };
+
             let config = serde_json::json!({
                 "brokers": "localhost:9092",
                 "client_id": "test",
@@ -1819,14 +1844,16 @@ pub mod test_support {
                             target: ContextEntryTarget::Primitive {
                                 domain: ContextDomain::TransportHeader,
                                 name: context_name("x-traces-topic"),
+                                matching: ContextNameMatching::AsciiCaseInsensitive,
                             },
                             form: ContextEntrySelectorForm::Value,
+                            take: ContextEntryTake::First,
                         }]
                         .into_boxed_slice(),
                     },
                 },
                 ContextDeclaration::Consumes {
-                    selector: ContextConsumerSelector::AllStored {
+                    selector: ContextConsumerSelector::AllCaptured {
                         domain: ContextDomain::TransportHeader,
                     },
                 },
@@ -7172,7 +7199,7 @@ pub mod test_support {
                 },
                 vec![],
             );
-            let policy = CompiledHeaderPropagationPolicy::compile(policy, &[])
+            let policy = CompiledHeaderPropagationPolicy::compile_standalone(policy, &[])
                 .expect("propagation policy compiles");
             let (_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
             let mut eh: EffectHandler<OtapPdata> = EffectHandler::new(
@@ -7220,6 +7247,91 @@ pub mod test_support {
                     .any(|(k, v)| k == "X-Tenant-Id" && v == b"acme"),
                 "the tenant transport header should be propagated onto the record"
             );
+        }
+
+        /// Scenario: Kafka propagation selects constant and UUID-v7 members without captured headers.
+        /// Guarantees: generated members are appended beside the required format header.
+        #[test]
+        fn build_kafka_headers_propagates_generated_members_without_captured_headers() {
+            let context_policy: ContextPolicy = serde_json::from_value(serde_json::json!({
+                "entries": {
+                    "outbound": [
+                        {
+                            "type": "constant",
+                            "name": "route",
+                            "value": "kafka"
+                        },
+                        {
+                            "type": "randomness",
+                            "name": "correlation",
+                            "value": "uuid7"
+                        }
+                    ]
+                }
+            }))
+            .expect("valid generated context policy");
+            let (name, definition) = context_policy
+                .entries
+                .into_iter()
+                .next()
+                .expect("declaration");
+            let propagation: HeaderPropagationPolicy = serde_json::from_value(serde_json::json!({
+                "default": {
+                    "selector": {
+                        "type": "named",
+                        "named": ["outbound:route", "outbound:correlation"]
+                    },
+                    "name": "stored_name"
+                }
+            }))
+            .expect("valid propagation policy");
+            let policy = CompiledHeaderPropagationPolicy::compile_standalone(
+                propagation,
+                &[ContextEntryDeclaration {
+                    scope: ContextScope::Engine,
+                    name,
+                    definition,
+                }],
+            )
+            .expect("generated propagation policy compiles");
+            let mut context = Context::default();
+            context.materialize_context(policy.materialization_plan());
+
+            let (_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
+            let mut effect_handler: EffectHandler<OtapPdata> = EffectHandler::new(
+                test_node("generated-header-test"),
+                reporter,
+                test_pipeline_runtime_services(),
+            );
+            effect_handler.set_propagation_policy(Some(policy));
+
+            let headers = KafkaExporter::build_kafka_headers(
+                MessageFormat::OtlpProto,
+                MSG_FORMAT_HEADER,
+                &context,
+                &effect_handler,
+            );
+            let found = (0..headers.count())
+                .map(|index| {
+                    let header = headers.get(index);
+                    (
+                        header.key.to_string(),
+                        header.value.map(<[u8]>::to_vec).unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            assert!(
+                found
+                    .iter()
+                    .any(|(key, value)| key == "route" && value == b"kafka")
+            );
+            let correlation = found
+                .iter()
+                .find(|(key, _)| key == "correlation")
+                .expect("correlation header");
+            assert_eq!(correlation.1.len(), 36);
+            assert_eq!(correlation.1[14], b'7');
         }
 
         /// Scenario (Kafka integration: encodings and routing): `build_kafka_headers` runs with no propagation policy
